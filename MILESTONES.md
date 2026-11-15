@@ -122,12 +122,28 @@ Dependency order: (1) GitHub repo, (2) push + CI, (3) Render deploy,
 end-to-end (create account → view market → place/reserve → settlement
 record → verify in ledger/audit trail) with persistence across requests.
 
-- **M1.1 Repo + push — BLOCKED 2026-11-14.** `create-repo joulex` →
-  403 "Resource not accessible by personal access token" (fine-grained
-  PAT scoped to selected repos; cannot create repos). Owner step:
-  create private `LunaTIKTOK/joulex` in the GitHub UI + widen PAT scope
-  to it. Local git init + first commit DONE this run so the push is one
-  command after that. Auth healthy (`whoami` 200 LunaTIKTOK).
+- **M1.1 Repo + push — DONE 2026-11-15 (code pushed; CI workflow
+  file still missing — see caveat).** Owner created
+  `LunaTIKTOK/JouleX` 2026-11-15 00:32 CST (public, with the JouleX
+  README — the audit asked for private `joulex`; the owner created
+  public `JouleX` instead, and the code is secrets-scanned clean, so
+  the push went to the repo as the owner created it; flip to private
+  in the GitHub UI if wanted). PAT has admin on the repo
+  (permission check 200). Push via the connector's `push-dir`: 154
+  files, commit `3311a76a8c573585e2734516bbcb8e3ae40760f7` on main,
+  parented on the owner's README commit `03ffd945` (history
+  preserved). Verified on GitHub: main == that commit, tree 154
+  blobs, README + `joulex/` + `demo.py` + `render.yaml` present.
+  **Caveat: `.github/workflows/ci.yml` is NOT on GitHub.** The
+  fine-grained PAT lacks the `workflow` scope: tree creation and
+  the Contents API both 403 on any tree containing
+  `.github/workflows/*` (reproduced minimally — a workflow-path
+  tree 403s, a normal nested path 201s). The push therefore excluded
+  `.github/`; no first Actions run has triggered. Owner step to
+  close it: widen the PAT with the `workflow` (Actions) scope, or
+  add `ci.yml` via the GitHub web UI — then the first Actions run
+  (M1.2's live leg) can fire. A docs-sync push after this entry
+  keeps GitHub main == local HEAD (same tree minus `.github/`).
 - **M1.2 CI — DONE 2026-11-14.** `.github/workflows/ci.yml`
   (push + PR to `main`, Python 3.12, Node 24, `npm ci` +
   `npm install --no-save jsdom`): pinned-measurement check

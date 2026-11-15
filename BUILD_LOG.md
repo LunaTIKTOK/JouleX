@@ -1888,3 +1888,85 @@ no goal timeline entries. Blockers unchanged: M1.1 (repo 403, owner
 creates LunaTIKTOK/joulex) + M1.3 (no Render key, owner dashboard step);
 live testnet settlement cycle still pending the owner key (transient);
 AESO written permission still owed; Phase 1 follows M1.
+
+## 2026-11-15 ~02:01 — Builder loop: M1.1 DONE (repo + push; CI workflow file blocked on PAT scope)
+
+Next NOT DONE milestone in order was M1.1 (M1.3 Render deploy still
+needs the owner dashboard step; M1.2's first live Actions run waits
+on the workflow file — see below; Phase 1 has no scoped spec for
+this loop).
+
+### Baseline first
+
+Full suite **491 passed** (65.35s, no drift from the 2026-11-15
+~00:40 run); `python3 scripts/verify_pin.py` → PIN OK
+(measurement de43115e…, newest provenance link 2bc11204…
+verifies); `python3 demo.py` → DEMO OK, exact balances (Alice
+1009.750104, Bob 985.124948, conservation 2000.0);
+`python3 quickstart.py` → TRADE OK in 0.37s (bar 600s). Working
+tree clean, HEAD 4f76a55 (M1.6).
+
+### The blocker had moved: owner created the repo
+
+`github_api.py repo LunaTIKTOK/joulex` → 200, `LunaTIKTOK/JouleX`
+(public, default branch main). Full metadata: created
+2026-11-15T06:32:24Z (00:32 CST), pushed 06:44:38Z, contents only
+README.md — the JouleX README (M0–M3 status), i.e. the owner did
+the M1.1 step ~00:32–00:44 CST, creating public `JouleX` rather
+than the private `joulex` the audit asked for. Decision: push to
+the repo as the owner created it. The code is secrets-scanned
+clean (see below), the visibility is the owner's own creation-time
+choice, and flipping public→private is one click in the GitHub UI
+if they want it. PAT permission on the repo: `admin` (200).
+(`gh` CLI is not authenticated in this environment; all checks
+went through the connector's `github_api.py`.)
+
+### Push, and the workflow-scope 403
+
+Secrets scan over the tracked tree before pushing: no private-key
+blocks, no `ghp_` / `github_pat_` / `sk-` / AWS tokens;
+`JOULEX_HCS_PRIVATE_KEY` appears only as an env-var reference;
+the demo issuer seed is env-only (`JOULEX_DEMO_ISSUER_SEED_HEX`,
+no hardcoded value); `data/trust_store.demo.json` holds public
+keys + a signed revocation list only, marked DEMO ONLY (Phase 0
+audit's scan already passed; re-confirmed this run). Staging built
+from `git ls-files` (155 files, byte-identical set to HEAD; no
+node_modules / __pycache__ / .pytest_cache — `push-dir` walks the
+raw directory and would have uploaded them, so the archive route
+matters).
+
+First `push-dir` failed at tree creation: 403 "Resource not
+accessible by personal access token" — AFTER all 155 blobs were
+created (~240 s of blob uploads, orphaned, harmless). Diagnosis,
+reproduced minimally: a tree containing `.github/workflows/ci.yml`
+403s; the same tree with a normal nested path (`joulex/probe.txt`)
+201s; a minimal tree with and without `base_tree` 201s; the
+Contents API `put-file` for ci.yml 403s identically. Root cause:
+the fine-grained PAT lacks the `workflow` scope — GitHub refuses
+any workflow-file write through the API without it. The blob/tree
+split is the tell: blob creation does not validate paths, tree
+creation does.
+
+Fix: pushed the tree WITHOUT `.github/` (154 files). Result:
+**commit `3311a76a8c573585e2734516bbcb8e3ae40760f7` on main**,
+parented on the owner's README commit `03ffd945` (history
+preserved). Verified on GitHub: main == that commit; tree 154
+blobs; README + `joulex/server.py` + `demo.py` + `render.yaml`
+present; `.github/workflows/ci.yml` absent (intended).
+
+### What this unblocks / what still needs the owner
+
+- M1.1 DONE (code pushed). M1.3 Render deploy is now unblocked at
+  the repo level — it still needs the owner's dashboard step (New
+  Web Service from `LunaTIKTOK/JouleX`, render.yaml detected,
+  Free plan), unchanged.
+- M1.2's first live GitHub Actions run is STILL pending: the
+  workflow file is not on GitHub. Owner step: widen the PAT with
+  the `workflow` (Actions) scope, or add `.github/workflows/ci.yml`
+  via the GitHub web UI — then the first Actions run can fire
+  (the workflow itself was verified locally end-to-end 2026-11-14).
+- No live Hedera, no x402/USDC, no hardware TEE, nothing touched
+  outside `~/workspace/joulex/`, no goal timeline entries. Live
+  testnet settlement cycle still pending the owner key (transient).
+  No Groq calls used (0/5 — no draft/review needed; the failure
+  was diagnosed empirically).
