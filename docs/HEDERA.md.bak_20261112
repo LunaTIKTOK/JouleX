@@ -1,0 +1,128 @@
+# Going live on Hedera (owner steps only — NOT built here)
+
+Status: **LIVE on testnet since 2026-11-10.** `RealHCS` is
+implemented (`joulex/hcs.py` + `joulex/hcs_submit.mjs`, via
+`@hashgraph/sdk` 2.81.0) and verified end to end: account
+`0.0.11389089` submitted the first message to topic `0.0.11399235`
+— receipt `SUCCESS`, topic sequence `1`, consensus timestamp
+`1794335407.470921104`, transaction
+`0.0.11389089@1794335331.345021439` — and the message was read back
+from the public testnet mirror node with matching content and
+`message_hash`. The exchange wires it through `make_hcs`: with
+`JOULEX_HCS_MODE=hedera` and a `hedera` config, every action is
+written locally first, then submitted; without the mode flag the log
+stays local. The operator key is never stored: it is read from
+`JOULEX_HCS_PRIVATE_KEY` at submit time only. **Mainnet is still a
+separate step** (new topic, funded mainnet account, owner's call).
+
+The v1 audit log underneath is still a LOCAL simulation when the
+mode flag is off: `joulex/hcs.py` writes `data/hcs_log.jsonl` with
+the header `{"mode": "local", "hedera_topic": null}` and timestamps
+labelled LOCAL. It is never a Hedera consensus timestamp and must
+never be described as one.
+
+## What the M1 layer does NOT prove (DESIGN.md §7.6)
+
+The software envelope proves which code tree minted the action and
+binds the action to that code; it does NOT prove the code ran on
+genuine hardware, that the host was uncompromised, or that the
+agent's judgement was sound. A compromised host can mint a valid
+software envelope for bad code — the measurement would differ from
+the pinned set, which is the detection, not prevention. The hardware
+leg (SEV-SNP CVM) is the answer to that residual and is a later,
+owner-decided step.
+
+## Owner steps to go live (in order — do not skip testnet)
+
+### 1. Create a Hedera account (testnet first)
+
+- Go to the Hedera portal (https://portal.hedera.com) and create a
+  **testnet** account. The owner creates it with their own keys —
+  never hand keys to an agent, never paste a private key into chat,
+  code, or a file in this repo.
+- Record the account ID (e.g. `0.0.123456`) somewhere the operator
+  controls. The testnet account holds testnet HBAR (free from the
+  testnet faucet); it cannot spend real value.
+
+### 2. Create an HCS topic (testnet, then mainnet)
+
+- On testnet, create a Hedera Consensus Service topic (e.g. via the
+  portal, the Hedera CLI, or a small script using the Hedera SDK —
+  owner-run, with the owner's keys).
+- Record the topic ID in `data/hcs_config.json`:
+  ```json
+  {"mode": "hedera", "hedera_topic": "0.0.1234567", "network": "testnet"}
+  ```
+  Until this file exists with a real topic, the log stays local.
+- Repeat on **mainnet** only after the testnet flow is verified
+  end to end (steps 3–5 below, on testnet). Use a separate mainnet
+  topic ID; never reuse the testnet topic for mainnet traffic.
+
+### 3. Fund the account with HBAR
+
+- Message fees are $0.0008/message as of Jan 2026 (Hedera network
+  pricing; re-check before funding — the figure is a network fee,
+  not a JouleX price). Fund testnet from the faucet; fund mainnet
+  with a small HBAR purchase through the owner's own exchange
+  account. Keep the balance modest: one message per action, so the
+  burn rate is exactly the action rate.
+
+### 4. Set `JOULEX_HCS_MODE=hedera`
+
+- This environment variable is the operator's declaration that the
+  account + topic above exist and are funded. On its own it changes
+  nothing in v1 — `RealHCS` is inert and ignores it. It exists so
+  the future live implementation has one explicit, operator-set
+  switch to read, and so a deployment that forgot the owner steps
+  fails loudly instead of silently staying local.
+
+### 5. Implement `RealHCS.submit` (code change, owner-ordered) — DONE 2026-11-10
+
+- `RealHCS.submit` is implemented: it builds the HCS message (same
+  schema as the local log), submits it to the configured topic via
+  `ConsensusSubmitMessage` (through `joulex/hcs_submit.mjs`), and
+  records the returned sequence number + consensus timestamp
+  alongside the local copy in the returned `hedera` block.
+- The local log remains the fallback and the replay source either
+  way: every message is written locally first, then submitted; a
+  submission failure never loses the record and never blocks the
+  action from being audited locally (the failure is carried in the
+  `hedera` block as `{"status": "failed", ...}`).
+- Key-supply caveat for a long-running server: the signing key must
+  be present in the server process's environment
+  (`JOULEX_HCS_PRIVATE_KEY`) at submit time. This VM does not
+  persist environment variables across replacements, so a deployed
+  server needs the key re-supplied on restart — that is an
+  owner-operated step, not something the code can solve by storing
+  the key (it never does).
+
+## Verification after going live
+
+1. Submit one test action on testnet; read the topic back (mirror
+   node or the Hedera SDK) and confirm the message, sequence, and
+   consensus timestamp match the local copy. — DONE 2026-11-10:
+   first message, sequence 1, consensus `1794335407.470921104`,
+   transaction `0.0.11389089@1794335331.345021439`, read back from
+   https://testnet.mirrornode.hedera.com/api/v1/topics/0.0.11399235/messages
+   with matching `message_hash`.
+2. Run `joulex.hcs.verify_log_file` on `data/hcs_log.jsonl` — it
+   must report `ok: true`. — DONE 2026-11-10 (local copy verified).
+3. Only then repeat steps 2–5 for mainnet. — NOT DONE; owner's call.
+
+## Re-pinning the measurement (operator maintenance)
+
+The pinned measurement set lives in `data/measurements.json`. The
+measurement is a hash of every `.py` file in `joulex/`, so ANY code
+change (including a bug fix) changes it. After any change to
+`joulex/*.py`:
+
+```bash
+python3 -c "import json; from joulex.attestation import compute_measurement; m = compute_measurement(); json.dump({'measurements': [m]}, open('data/measurements.json', 'w'), indent=2)"
+python3 -c "from joulex.provenance import build_link; print(build_link(data_dir='data')[0])"
+python3 -m pytest tests/ -q   # must stay green
+```
+
+A deployment copies its own `data/measurements.json` into its data
+directory; the exchange loads it at startup and the verifier rejects
+measurements not in the pinned set when a policy requires it. A
+corrupt `measurements.json` refuses startup (fail closed).

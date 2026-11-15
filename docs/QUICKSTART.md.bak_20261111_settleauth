@@ -1,0 +1,230 @@
+# JouleX quickstart — discovery to first paper trade in under 10 minutes
+
+Paper only. No account, no key, no signup, no money. You need Python
+3.12 and a checkout of this repo. Timed cold on 2026-11-10: **0.48–1.19 s** in-script (0.66–1.65 s
+wall clock including interpreter start) from `python3 quickstart.py`
+to `TRADE OK` across runs — the bar is 600 s.
+
+## 0. Get the code (30 seconds)
+
+```bash
+git clone <this-repo> joulex   # or copy the directory
+cd joulex
+python3 --version              # needs 3.12; stdlib only, nothing to install
+```
+
+Everything runs from the repo root (`~/workspace/joulex/` in the
+reference checkout). State lives under `./data/` (created on first
+run).
+
+## 1. Start the service (10 seconds)
+
+```bash
+python3 -m joulex.server
+```
+
+You should see:
+
+```
+joulex v0.1.0 listening on http://127.0.0.1:8472 (paper-only, demo_clock=False)
+```
+
+Default port is **8472**; `--port` overrides it. The service is
+paper-only: `GET http://127.0.0.1:8472/` reports
+`"paper_only": true`. Leave the server running in this terminal.
+
+Useful flags (all in `python3 -m joulex.server --help`):
+
+- `--demo-clock` — enables `POST /__demo/set_time` (demo/test only).
+- `--aeso-oracle` — settle `aeso_price` markets from a live AESO
+  pool-price fetch; without it, settlement takes an
+  operator-supplied observed max price.
+- `--trust-store <file>` — JSON with `trusted_issuers` +
+  `revocation_lists`; without it the exchange starts with an empty
+  trust store and every order is rejected until a trust store is
+  configured (fail closed).
+- `--operator-key <key>` — human-held secret for market creation
+  via `X-Operator-Key` (prefer the `JOULEX_OPERATOR_KEY` env var —
+  a flag value shows in the process list).
+
+## 2. Discover it (10 seconds)
+
+```bash
+curl http://127.0.0.1:8472/
+curl http://127.0.0.1:8472/time
+curl http://127.0.0.1:8472/markets
+```
+
+`GET /` answers name, version, paper-only flag, server time, and
+the Verifiable Compute block (`envelope_version`,
+`joulex-attest-0.1`, `kind: software`, `hcs_mode: local`).
+`GET /markets` is `[]` on a fresh server. Full reference:
+`docs/API.md`.
+
+## 3. First paper trade — the scripted way (under 1 second)
+
+```bash
+python3 quickstart.py
+```
+
+It starts its own server on port 8472 (demo clock + demo-issuer
+trust store), discovers it, mints a demo L3 credential for one test
+agent, creates a `flex_capacity` / `aeso_price` market through the
+admitted path, checks the balance, and buys 10 YES. Expected output
+(ends with):
+
+```
+TRADE OK — first paper trade complete in 0.48s (bar: 600s). Receipt: {...}
+```
+
+(Cold runs on 2026-11-10 measured 0.48–1.19 s in-script; the
+figure above is from the fastest run.) The receipt is the trade: `cost_points` ~5.12, `price_yes_after`
+~0.5250, `balance_after` ~994.88 (from a 1,000-point endowment
+credited on the first verified order — a fresh agent reads 0.00
+before its first order; that is expected, not an error). The
+quickstart state is kept in a temp dir printed at the end; the
+server stops when the script exits.
+
+## 4. First paper trade — by hand (2 minutes)
+
+Do this if you want to see each step instead of running the script.
+It uses the same pieces `quickstart.py` uses:
+`joulex/client.py` (`ExchangeClient`) and `joulex/demo_issuer.py`
+(demo L3 issuer — test principals only; a real agent gets its
+credential from a real issuer). Save this as `first_trade.py` in
+the repo root and run `python3 first_trade.py` — it starts its own
+server (demo clock + demo-issuer trust store) so admission actually
+passes. A server started bare (`python3 -m joulex.server` with no
+`--trust-store`) rejects every order: fail closed, empty trust
+store, no exceptions.
+
+```python
+import json, os, subprocess, sys, tempfile, time
+from datetime import datetime, timedelta, timezone
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from joulex.client import ExchangeClient
+from joulex.demo_issuer import DemoIssuer
+from joulex.server import DemoClock
+
+clock = DemoClock(datetime.now(timezone.utc))
+issuer = DemoIssuer(now_fn=clock)
+tmp = tempfile.mkdtemp(prefix="joulex-first-trade-")
+with open(os.path.join(tmp, "trust_store.json"), "w") as f:
+    json.dump({"trusted_issuers": issuer.trust_store,
+               "revocation_lists": {issuer.issuer_id: issuer.revocation_list()}}, f)
+server = subprocess.Popen(
+    [sys.executable, "-m", "joulex.server", "--port", "8472",
+     "--data-dir", os.path.join(tmp, "data"),
+     "--trust-store", os.path.join(tmp, "trust_store.json"),
+     "--demo-clock"], cwd=os.path.dirname(os.path.abspath(__file__)),
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+try:
+    client = ExchangeClient("http://127.0.0.1:8472")
+    for _ in range(80):
+        try:
+            client.info(); break
+        except Exception:
+            time.sleep(0.25)
+
+    print(client.info())                       # discovery
+    print(client.server_time())
+
+    agent = issuer.mint_agent(
+        principal_id="principal-me", display_name="Me",
+        agent_id="agent-me-1")                # demo L3 credential
+
+    now = datetime.fromisoformat(client.server_time())
+    market = client.create_market(
+        agent["credential"], agent["agent_seed"],
+        question="Will the Alberta pool price exceed $50/MWh during the delivery window?",
+        resolution_type="aeso_price", contract_type="flex_capacity",
+        strike=50.0,
+        window_start=(now + timedelta(days=1)).isoformat(),
+        window_end=(now + timedelta(days=1, hours=6)).isoformat(),
+        resolves_at=(now + timedelta(days=1)).isoformat(), b=100.0)
+    print(market["market_id"], market["price_yes"])   # 0.5 at open
+
+    receipt = client.place_order(
+        agent["credential"], agent["agent_seed"],
+        {"agent_id": "agent-me-1", "market_id": market["market_id"],
+         "side": "YES", "shares": 10, "action": "buy"})
+    print(receipt)                             # trade receipt
+    print(client.positions("agent-me-1"))      # balance + 10 YES shares
+finally:
+    server.terminate()
+```
+
+Notes:
+
+- Every order needs a fresh challenge first (`GET /challenge`),
+  a presentation bound to the exact order payload, and an L3
+  credential covering tool `joulex.place_order`. `ExchangeClient`
+  does the challenge → sign → submit round trip for you. See
+  `docs/ADMISSION.md` for how admission works and what each 401
+  means.
+- A challenge is single-use: replaying a presentation is 401
+  `KYA_CHALLENGE_REUSED`. A failed verification never burns a
+  challenge, so retry with a fresh one.
+- No credential, no trade. L1/L2 credentials are rejected for
+  trading (L3 only). There is no back door and no operator override
+  for orders — the operator key creates markets, it does not place
+  orders.
+
+## 5. See the whole cycle (1 minute)
+
+```bash
+python3 demo.py
+```
+
+Two agents, two markets (one `flex_capacity` / `aeso_price`, one
+`compute_forward` / `public_source`), trades, settlement, exact
+balances: **Alice 1009.750104, Bob 985.124948, conservation
+2000.0** — asserted in the script, not printed and hoped for. One
+order carries a software attestation envelope (`DEMO OK` at the
+end).
+
+## 6. Check the audit trail (30 seconds)
+
+Every action is one ordered message in the local HCS-schema log
+(`data/hcs_log.jsonl`):
+
+```bash
+curl http://127.0.0.1:8472/hcs-log/verify     # {"ok": true, ...}
+curl "http://127.0.0.1:8472/hcs-log?limit=3"  # latest messages first
+curl http://127.0.0.1:8472/attestations       # envelopes on record
+curl http://127.0.0.1:8472/reconcile          # {"ok": true, ...}
+```
+
+The log is a **local** simulation (timestamps labelled LOCAL, header
+`{"mode": "local", "hedera_topic": null}`) — never a Hedera
+consensus log. Going live on Hedera is an owner step:
+`docs/HEDERA.md`.
+
+## 7. Run the tests (25 seconds)
+
+```bash
+python3 -m pytest tests/ -q
+```
+
+Expect `303 passed` (M0 215 + M1 41 + M2 29 + M3 18). If anything
+fails, the build is not green and the docs above are not to be
+trusted until it is.
+
+## What this is not
+
+- **Not real money.** Paper points only (1,000 per agent). No USDC,
+  no x402, no settlement hook that moves value.
+- **Not hardware attestation.** The envelope proves which code tree
+  minted the action (software attestation); it does not prove the
+  code ran on genuine hardware.
+- **Not live Hedera.** The audit log is local until the owner
+  creates an account + topic and orders the connection
+  (`docs/HEDERA.md`).
+- **Not a buyer, a licence, or AESO commercial use.** AESO data is
+  non-commercial research only; the orchestrator simulation is
+  labelled synthetic where it uses synthetic prices
+  (`docs/API.md`, `README.md`).
+
+Next: `docs/API.md` (full reference), `docs/ADMISSION.md` (how
+admission works), `docs/HEDERA.md` (going live on Hedera),
+`README.md` (the whole picture in one page).

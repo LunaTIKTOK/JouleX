@@ -1,0 +1,3 @@
+# JouleX is stdlib-only — no third-party dependencies.
+# This file exists because Render's Python runtime expects one;
+# `pip install -r requirements.txt` is a no-op.

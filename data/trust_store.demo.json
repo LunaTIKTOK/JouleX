@@ -1,0 +1,16 @@
+{
+  "_demo_only": true,
+  "note": "DEMO ONLY \u2014 paper-only demo issuer for the JouleX deployment. Throwaway keys: this file holds public keys and a signed public revocation list only. It never authorises real value. Revocation lists go stale after 1 hour; refresh via scripts/mint_demo_agents.py before a demo session.",
+  "revocation_lists": {
+    "demo-issuer.joulex.local": {
+      "issued_at": "2026-11-10T19:17:31.308886+00:00",
+      "issuer_id": "demo-issuer.joulex.local",
+      "revoked_credential_ids": [],
+      "revoked_delegation_ids": [],
+      "signature_hex": "5ab1fc187401288ff283c4cfdee884aa453d6e3382e877ace7f906ed475411f4813ca42fbbac21d4efe95ab334d2060676f4b4a858876c82cdd620f83376b201"
+    }
+  },
+  "trusted_issuers": {
+    "demo-issuer.joulex.local": "2d5a3d14fb3ef209dc1d90061f9af79eb69e4ce7e6a70f42a73bf4c71ff90639"
+  }
+}

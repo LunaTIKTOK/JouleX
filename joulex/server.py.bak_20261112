@@ -1,0 +1,377 @@
+"""HTTP service — stdlib ``http.server`` only, JSON API.
+
+Run: ``python3 -m joulex.server [--port N] [--data-dir DIR]
+[--demo-clock] [--trust-store FILE]``
+
+- ``--demo-clock`` enables ``POST /__demo/set_time`` (sets server time).
+  Without it the route does not exist (404). Demo/test only.
+- ``--trust-store`` points at a JSON file
+  ``{"trusted_issuers": {...}, "revocation_lists": {issuer_id: list}}``
+  loaded at startup. Without it the exchange starts with an empty trust
+  store and every order is rejected until the operator posts a
+  revocation list and the trust store is configured — fail closed.
+
+Threading server; the Exchange holds a re-entrant lock around mutations.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from . import __version__
+from .exchange import Exchange, ExchangeError
+from .markets import parse_time
+
+DEFAULT_PORT = 8472
+DEFAULT_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
+
+
+def _page_params(query: dict[str, list[str]]) -> tuple[int, int]:
+    """limit/offset for the paginated read routes. Defaults limit=50,
+    offset=0; limit clamped to [1, 200]; garbage is a 400, never a
+    silent default."""
+    try:
+        limit = int((query.get("limit") or ["50"])[0])
+        offset = int((query.get("offset") or ["0"])[0])
+    except ValueError:
+        raise ExchangeError(400, "INVALID_REQUEST: limit/offset must be integers") from None
+    if offset < 0:
+        raise ExchangeError(400, "INVALID_REQUEST: offset must be >= 0")
+    return max(1, min(limit, 200)), offset
+
+
+def _optional_time(query: dict[str, list[str]], name: str):
+    """One optional ISO-8601 query param, or None when absent. A
+    present-but-unparseable value is a 400."""
+    raw = (query.get(name) or [None])[0]
+    if raw is None:
+        return None
+    try:
+        return parse_time(raw)
+    except ValueError:
+        raise ExchangeError(400, f"INVALID_REQUEST: {name} must be an ISO-8601 timestamp") from None
+
+
+class DemoClock:
+    """Mutable clock for demo/test servers. ``--demo-clock`` only."""
+
+    def __init__(self, start: datetime | None = None):
+        self._now = start or datetime.now(timezone.utc)
+
+    def __call__(self) -> datetime:
+        return self._now
+
+    def set(self, when: datetime) -> None:
+        self._now = when
+
+
+def make_server(
+    exchange: Exchange,
+    *,
+    host: str = "127.0.0.1",
+    port: int = DEFAULT_PORT,
+    demo_clock: DemoClock | bool = False,
+) -> ThreadingHTTPServer:
+    """``demo_clock`` may be True (fresh DemoClock), False (no demo
+    endpoint), or a mutable clock object with ``.set(datetime)`` — in
+    which case the exchange MUST already use that same object as its
+    clock, so the demo endpoint moves exchange time too."""
+    if isinstance(demo_clock, bool):
+        demo_clock = DemoClock() if demo_clock else None
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt: str, *args: Any) -> None:  # keep stdout clean
+            sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+
+        # -- helpers ---------------------------------------------------
+        def _send(self, status: int, obj: Any) -> None:
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(status)
+            # Local demo service: allow the static demo.html page
+            # (opened via file://) to call the API from any origin.
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CF-KYA")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_OPTIONS(self) -> None:
+            # CORS preflight: headers only, no body (204 must be empty).
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-CF-KYA")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def _read_body(self) -> dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or 0)
+            if length == 0:
+                return {}
+            raw = self.rfile.read(length)
+            try:
+                data = json.loads(raw.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                raise ExchangeError(400, "INVALID_JSON")
+            if not isinstance(data, dict):
+                raise ExchangeError(400, "INVALID_JSON: body must be an object")
+            return data
+
+        def _handle(self, fn) -> None:
+            try:
+                status, obj = fn()
+            except ExchangeError as exc:
+                status, obj = exc.status, {"error": "exchange_error", "reason": exc.reason}
+            except Exception as exc:  # never leak a stack trace as a 500 body
+                status, obj = 500, {"error": "internal", "reason": str(exc)}
+            self._send(status, obj)
+
+        # -- routing ---------------------------------------------------
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+
+            def route():
+                if path == "/":
+                    return 200, exchange.info(demo_clock=demo_clock is not None)
+                if path == "/time":
+                    return 200, {"server_time": exchange.now().isoformat()}
+                if path == "/markets":
+                    return 200, exchange.list_markets()
+                if path.startswith("/markets/"):
+                    return 200, exchange.get_market(path.split("/", 2)[2])
+                if path == "/challenge":
+                    return 200, exchange.issue_challenge()
+                if path == "/positions":
+                    agent_id = (query.get("agent_id") or [None])[0]
+                    if not agent_id:
+                        raise ExchangeError(400, "INVALID_REQUEST: agent_id required")
+                    return 200, exchange.positions(agent_id)
+                if path == "/ledger":
+                    return 200, exchange.ledger_view()
+                if path == "/reconcile":
+                    # M5: read-only audit — re-derives every balance
+                    # from the logs; 200 with the report either way,
+                    # the report's "ok" flag is the verdict.
+                    return 200, exchange.reconcile()
+                if path == "/attestations":
+                    # M3: attestation envelopes carried on log
+                    # messages, latest first, paginated.
+                    limit, offset = _page_params(query)
+                    return 200, exchange.list_attestations(limit=limit, offset=offset)
+                if path == "/hcs-log":
+                    # M3: HCS audit-log messages, latest first.
+                    # ?agent_id= filters to messages the agent sent;
+                    # ?from= / ?to= bound consensus timestamps.
+                    limit, offset = _page_params(query)
+                    agent_id = (query.get("agent_id") or [None])[0]
+                    return 200, exchange.hcs_log(
+                        limit=limit,
+                        offset=offset,
+                        agent_id=agent_id,
+                        from_ts=_optional_time(query, "from"),
+                        to_ts=_optional_time(query, "to"),
+                    )
+                if path == "/hcs-log/verify":
+                    # M3: log integrity report (hash chain, sequence,
+                    # timestamp monotonicity).
+                    return 200, exchange.hcs_verify()
+                if path == "/hcs-log/knowledge":
+                    # M3: what agent X knew at time T (log replay).
+                    agent_id = (query.get("agent_id") or [None])[0]
+                    at = (query.get("at") or [None])[0]
+                    if not agent_id or not at:
+                        raise ExchangeError(
+                            400, "INVALID_REQUEST: agent_id and at required"
+                        )
+                    try:
+                        return 200, exchange.hcs_knowledge(agent_id, at)
+                    except ValueError:
+                        raise ExchangeError(
+                            400, "INVALID_REQUEST: at must be an ISO-8601 timestamp"
+                        ) from None
+                if path == "/hcs-log/provenance":
+                    # M3: who told whom — messages where from_agent
+                    # supplied the information to_agent's action
+                    # relied on. Optional ?t0= / ?t1= time window.
+                    from_agent = (query.get("from_agent") or [None])[0]
+                    to_agent = (query.get("to_agent") or [None])[0]
+                    if not from_agent or not to_agent:
+                        raise ExchangeError(
+                            400, "INVALID_REQUEST: from_agent and to_agent required"
+                        )
+                    return 200, exchange.hcs_provenance(
+                        from_agent,
+                        to_agent,
+                        _optional_time(query, "t0"),
+                        _optional_time(query, "t1"),
+                    )
+                if path == "/aeso/price":
+                    # Latest AESO hourly pool price + source. Live
+                    # fetch; 503 when AESO is unreachable — never a
+                    # stale or guessed value.
+                    from .aeso import AESOUnavailable, fetch_current_pool_price
+
+                    try:
+                        return 200, fetch_current_pool_price()
+                    except AESOUnavailable as exc:
+                        raise ExchangeError(503, f"{exc.code}: {exc.detail}") from exc
+                if path == "/__demo/agents":
+                    # Demo fixtures only: test credentials written by
+                    # demo.py (throwaway keys, labelled in the page).
+                    if demo_clock is None:
+                        raise ExchangeError(404, "NOT_FOUND")
+                    agents = exchange.store.load_json("demo_agents.json", None)
+                    if agents is None:
+                        raise ExchangeError(404, "DEMO_AGENTS_NOT_FOUND")
+                    return 200, agents
+                raise ExchangeError(404, "NOT_FOUND")
+
+            self._handle(route)
+
+        def do_POST(self) -> None:
+            parsed = urlparse(self.path)
+            path = parsed.path
+
+            def route():
+                if path == "/markets":
+                    # Operator key, when present, is authoritative: the
+                    # KYA header is not even parsed on that path, so a
+                    # stale/garbage KYA header cannot shadow it.
+                    operator_key = self.headers.get("X-Operator-Key")
+                    presentation = None
+                    if operator_key is None:
+                        from kya import presentation_from_header
+
+                        header = self.headers.get("X-CF-KYA")
+                        if header:
+                            try:
+                                presentation = presentation_from_header(header)
+                            except ValueError:
+                                raise ExchangeError(401, "KYA_PRESENTATION_INVALID") from None
+                    return 201, exchange.create_market(
+                        presentation,
+                        operator_key=operator_key,
+                        **self._read_body(),
+                    )
+                if path == "/orders":
+                    from kya import presentation_from_header
+
+                    header = self.headers.get("X-CF-KYA")
+                    presentation = None
+                    if header:
+                        try:
+                            presentation = presentation_from_header(header)
+                        except ValueError:
+                            raise ExchangeError(401, "KYA_PRESENTATION_INVALID") from None
+                    return 200, exchange.place_order(presentation, self._read_body())
+                if path.startswith("/markets/") and path.endswith("/settle"):
+                    market_id = path.split("/")[2]
+                    body = self._read_body()
+                    return 200, exchange.settle_market(
+                        market_id,
+                        operator_key=self.headers.get("X-Operator-Key"),
+                        observed_value=body.get("observed_value"),
+                        outcome=body.get("outcome"),
+                        evidence=body.get("evidence"),
+                        attestation=body.get("attestation"),
+                        attestation_binding=body.get("attestation_binding"),
+                    )
+                if path == "/revocation-lists":
+                    ok, reason = exchange.refresh_revocation_list(self._read_body())
+                    if not ok:
+                        raise ExchangeError(400, reason)
+                    return 200, {"ok": True, "reason": reason}
+                if path == "/__demo/set_time":
+                    if demo_clock is None:
+                        raise ExchangeError(404, "NOT_FOUND")
+                    body = self._read_body()
+                    try:
+                        demo_clock.set(parse_time(body["time"]))
+                    except (KeyError, ValueError):
+                        raise ExchangeError(400, "INVALID_REQUEST: time required (ISO-8601)") from None
+                    return 200, {"server_time": exchange.now().isoformat()}
+                raise ExchangeError(404, "NOT_FOUND")
+
+            self._handle(route)
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    return server
+
+
+def build_exchange(data_dir: str, trust_store_path: str | None, demo_clock: DemoClock | None, aeso_oracle: bool = False, operator_key: str | None = None) -> Exchange:
+    trusted_issuers: dict[str, str] = {}
+    revocation_lists: dict[str, dict[str, Any]] = {}
+    if trust_store_path:
+        with open(trust_store_path, "r", encoding="utf-8") as f:
+            store = json.load(f)
+        trusted_issuers = store.get("trusted_issuers", {})
+        revocation_lists = store.get("revocation_lists", {})
+    settlement_oracle = None
+    if aeso_oracle:
+        from .aeso import AESOPriceOracle
+
+        settlement_oracle = AESOPriceOracle()
+    exchange = Exchange(
+        data_dir=data_dir,
+        now_fn=(demo_clock or (lambda: datetime.now(timezone.utc))),
+        trusted_issuers=trusted_issuers,
+        settlement_oracle=settlement_oracle,
+        operator_key=operator_key,
+    )
+    for issuer_id, rev_list in revocation_lists.items():
+        ok, reason = exchange.refresh_revocation_list(rev_list)
+        if not ok:
+            print(f"warning: revocation list for {issuer_id} not accepted: {reason}", file=sys.stderr)
+    return exchange
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="JouleX — paper-only, stdlib-only.")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR)
+    parser.add_argument("--trust-store", default=None,
+                        help="JSON file with trusted_issuers + revocation_lists")
+    parser.add_argument("--demo-clock", action="store_true",
+                        help="enable POST /__demo/set_time (demo/test only)")
+    parser.add_argument("--aeso-oracle", action="store_true",
+                        help="settle aeso_price markets from a live AESO pool-price fetch (M0); without it, settlement uses an operator-supplied observed_value (max pool price over the window)")
+    parser.add_argument("--operator-key", default=None,
+                        help="human-held secret for market creation and settlement via the X-Operator-Key header (M2; "
+                        "settlement gated 2026-11-11); "
+                        "prefer the JOULEX_OPERATOR_KEY env var — a flag value shows in the process list. "
+                        "Without a key the operator path is closed and creation needs a CF-KYA presentation.")
+    args = parser.parse_args(argv)
+
+    demo_clock = DemoClock() if args.demo_clock else None
+    operator_key = args.operator_key or os.environ.get("JOULEX_OPERATOR_KEY")
+    exchange = build_exchange(args.data_dir, args.trust_store, demo_clock, aeso_oracle=args.aeso_oracle, operator_key=operator_key)
+    server = make_server(exchange, host=args.host, port=args.port, demo_clock=demo_clock)
+    print(
+        f"joulex v{__version__} listening on http://{args.host}:{args.port} "
+        f"(paper-only, demo_clock={args.demo_clock})",
+        flush=True,
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

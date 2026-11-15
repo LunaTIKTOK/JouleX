@@ -1,0 +1,3642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JouleX Sandbox — paper-only Alberta energy &amp; compute exchange</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#f6f7f9;color:#1a1a1a;line-height:1.45}
+header{background:#0f2a43;color:#fff;padding:14px 20px}
+header h1{margin:0;font-size:22px}
+header p{margin:4px 0 0;color:#cfe0ef}
+.banner{background:#b91c1c;color:#fff;padding:10px 20px;font-weight:700;text-align:center}
+.banner span{font-weight:400}
+main{max-width:1060px;margin:0 auto;padding:16px 20px 60px}
+section{background:#fff;border:1px solid #ddd;border-radius:8px;padding:16px;margin:14px 0}
+h2{margin:0 0 10px;font-size:18px}
+h3{margin:14px 0 6px;font-size:15px}
+.dim{color:#666;font-size:13px}
+.ok{color:#15803d}.err{color:#b91c1c}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.notice{display:none;padding:10px 12px;border-radius:6px;margin:10px 0}
+.notice.ok{background:#dcfce7;color:#14532d}
+.notice.err{background:#fee2e2;color:#7f1d1d}
+.card{border:1px solid #ddd;border-radius:8px;padding:12px;margin:10px 0;background:#fbfbfb}
+.mkt-q{font-weight:700}
+.mkt-meta{color:#555;font-size:13px;margin:4px 0}
+.outcome{display:flex;align-items:center;gap:8px;margin:6px 0}
+.olabel{min-width:90px;font-weight:600}
+.bar{flex:1;height:14px;background:#e5e7eb;border-radius:4px;overflow:hidden}
+.fill{height:100%;background:#2563eb}
+.oprice{min-width:48px;text-align:right;font-weight:700}
+.opos{color:#666;font-size:12px}
+.trade{display:flex;gap:6px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.trade input[type=number]{width:90px}
+.quote{color:#444;font-size:13px}
+button{cursor:pointer;background:#0f2a43;color:#fff;border:0;border-radius:6px;padding:7px 12px;font-size:14px}
+button:disabled{opacity:.5;cursor:default}
+button.active{background:#2563eb}
+.settle{margin-top:8px}
+.settle-box{display:flex;gap:6px;margin-top:8px;flex-wrap:wrap}
+.settle-box input[type=text]{flex:1;min-width:220px}
+.settle-note{color:#666;font-size:12px;display:block;margin-top:4px}
+.resolved{background:#dcfce7;border-radius:6px;padding:8px;margin-top:8px}
+table{border-collapse:collapse;width:100%}
+th,td{border-bottom:1px solid #e5e7eb;padding:6px 8px;text-align:left;font-size:14px}
+th{background:#f3f4f6}
+input,select{padding:7px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+label{display:block;margin:8px 0 2px;font-weight:600;font-size:13px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.grid{grid-template-columns:1fr}}
+canvas{width:100%;height:260px;border:1px solid #ddd;border-radius:6px;background:#fff}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:700}
+.pill.live{background:#dcfce7;color:#14532d}
+.pill.synth{background:#fef3c7;color:#92400e}
+.pill.paper{background:#e0e7ff;color:#3730a3}
+.pill.none{background:#fee2e2;color:#7f1d1d}
+footer{color:#666;font-size:13px;padding:20px}
+</style>
+</head>
+<body>
+<header>
+<h1>JouleX Sandbox</h1>
+<p>An AI-agent exchange for Alberta electricity, compute capacity &amp; workload flexibility — paper trading on real market rules.</p>
+</header>
+<div class="banner">SANDBOX · PAPER ONLY · $0 — no real money, no real power, no real counterparties. <span>Every trade settles in paper points. Nothing here is a real market.</span></div>
+<main>
+<div id="notice" class="notice"></div>
+
+<section>
+<h2>Your sandbox clock &amp; agent</h2>
+<p>Sandbox time: <b id="clock-mt">—</b> (<span id="clock-utc">—</span>) · <span id="clock-next" class="dim"></span></p>
+<p>
+<button id="advance-1h">+1 hour</button>
+<button id="advance-6h">+6 hours</button>
+<button id="advance-24h">+24 hours</button>
+<button id="jump-next">Jump to next resolvable market</button>
+</p>
+<p class="dim">Markets resolve only after their resolves_at. The clock is a demo clock (like the JouleX demo): advance it to trade, settle, and see payouts — no waiting days.</p>
+<p>Trade as:
+<button data-agent="you" class="active">you</button>
+<button data-agent="alice">alice</button>
+<button data-agent="bob">bob</button>
+— every agent starts with 1,000 paper points (joulex/ledger.py STARTING_POINTS).
+<label style="display:inline;margin-left:12px"><input type="checkbox" id="auto-trader"> Simulate other traders (alice/bob place a small trade every 5s)</label>
+</p>
+<p><button id="reset-sandbox">Reset sandbox to seed state</button></p>
+</section>
+
+<section>
+<h2>Markets — open</h2>
+<div id="markets-open"></div>
+<h3>Settled</h3>
+<div id="markets-resolved"></div>
+</section>
+
+<section>
+<h2>Create a market</h2>
+<form id="create-form" onsubmit="return false">
+<label>Question <input name="question" type="text" style="width:100%" placeholder="Will the Alberta pool price exceed $75/MWh on Nov 9?" required></label>
+<label>Type
+<select name="rectype">
+<option value="aeso">Flex capacity — AESO pool price (binary YES/NO)</option>
+<option value="compute">Compute forward — public source (binary YES/NO)</option>
+<option value="generic">Generic event — public source (multi-outcome allowed)</option>
+</select></label>
+<div class="aeso-only">
+<label>Strike ($/MWh) <input name="strike" type="number" step="0.01" value="50"></label>
+<label>Window start <input name="window_start" type="datetime-local" value="2026-11-05T00:00"></label>
+<label>Window end <input name="window_end" type="datetime-local" value="2026-11-05T06:00"></label>
+<p class="dim">The window must fall inside a price series the sandbox holds: the SYNTHETIC series (Oct 27–Nov 10, 2026) or the LIVE SNAPSHOT hours (Nov 12, 05:00–08:00 MT). A window the series does not cover refuses settlement — fail-closed, like the real oracle.</p>
+</div>
+<div class="public-only">
+<label>Source URL <input name="source_url" type="text" style="width:100%" placeholder="https://example.com/source"></label>
+<label>Resolution rule (one line) <input name="source_description" type="text" style="width:100%" placeholder="YES iff the published value is above X."></label>
+<label>Outcomes (comma-separated, 2–10; leave blank for YES/NO) <input name="outcomes" type="text" style="width:100%" placeholder="$0–25, $25–50, $50–100, $100+"></label>
+</div>
+<label>Resolves at <input name="resolves_at" type="datetime-local" value="2026-11-09T00:00" required></label>
+<p class="dim">Times are read in your browser's local timezone. Resolves_at must be 1–30 days after the sandbox clock (joulex/markets.py rule).</p>
+<label>Liquidity parameter b <input name="b" type="number" step="1" value="100"></label>
+<button id="create-market" type="button">Create market</button>
+</form>
+<p class="dim">Sandbox only: no CF-KYA admission, no operator key, no attestation. Production market creation requires an admitted L3 credential or the operator key.</p>
+</section>
+
+<section>
+<h2>Your portfolio — <span id="agent-name">you</span></h2>
+<p>Balance: <b id="agent-balance">—</b></p>
+<table><thead><tr><th>Market</th><th>Side</th><th>Shares</th><th>Value</th></tr></thead>
+<tbody id="positions"></tbody></table>
+<h3>Ledger (all agents + pool)</h3>
+<table><thead><tr><th>Account</th><th>Balance</th></tr></thead><tbody id="ledger"></tbody></table>
+<p id="conservation"></p>
+<p class="dim">Settlement pays exactly 1 point per winning share, 0 per losing share, debited from the pool. Conservation: Σ balances + pool = 1,000 × agents — points are never created or destroyed (joulex/ledger.py).</p>
+</section>
+
+<section id="price-panel">
+<h2>Alberta pool price</h2>
+<canvas id="price-chart" width="1000" height="260"></canvas>
+<p id="price-stats" class="dim"></p>
+<p id="live-snapshot"></p>
+<p><span class="pill synth">SYNTHETIC</span> <span class="pill live">LIVE SNAPSHOT</span> <span class="pill paper">PAPER</span></p>
+</section>
+
+<section>
+<h2>Flexibility scheduler — the orchestrator</h2>
+<p class="dim">The real workload-scheduling algorithm (joulex/orchestrator.py, ported 1:1 and parity-tested): 24 deferrable GPU jobs over the 14-day SYNTHETIC series, 1.0&nbsp;MW facility cap. It compares run-at-arrival (fixed), earliest-deadline-first greedy, and the orchestrator (greedy + most-constrained-first, each improved by local search). The verdict bar is the production one: GO iff ≥5% better than greedy net of coordination cost, SLA 100%, and 100% of decisions audited.</p>
+<button id="run-scheduler">Run scheduler on SYNTHETIC series</button>
+<div id="scheduler-result"></div>
+</section>
+
+<section>
+<h2>HCS audit log — local mode</h2>
+<p id="log-status"></p>
+<p class="dim">Schema mirrors Hedera Consensus Service (joulex/hcs.py LocalHCS): strictly increasing sequence, consensus timestamp in HCS nanosecond format, sender, action, payload hash, hash chain. <b>This is a LOCAL simulation — not a Hedera consensus log.</b> The live path is Hedera testnet topic <span class="mono">0.0.11399235</span>; this sandbox never submits to it. Attestation: none (null) — the sandbox carries no verifiable-compute envelopes.</p>
+<p id="log-count" class="dim"></p>
+<table><thead><tr><th>#</th><th>Consensus time</th><th>Sender</th><th>Action</th><th>Payload hash</th></tr></thead>
+<tbody id="log-body"></tbody></table>
+</section>
+
+<section>
+<h2>Suppliers &amp; data centres — real status</h2>
+<table>
+<tr><th>Item</th><th>Status</th><th>Detail</th></tr>
+<tr><td>AESO live price feed</td><td><span class="pill live">CONNECTED (server)</span></td><td>Keyless public ETS report, fetched Nov 12, 2026 ~08:47 MT — 4 hourly pool prices ($3.59–$21.18/MWh). Covers only the recent ~3 hours; the historical report returns HTTP 403. A browser cannot fetch it directly (no CORS headers, plain HTTP).</td></tr>
+<tr><td>Power suppliers onboarded</td><td><span class="pill none">0 — NONE YET</span></td><td>No supplier has been contacted or onboarded. No real supply, no real bids.</td></tr>
+<tr><td>Data centres onboarded</td><td><span class="pill none">0 — NONE YET</span></td><td>No data centre has been contacted or onboarded. No real compute capacity.</td></tr>
+<tr><td>Liquidity</td><td><span class="pill paper">SIMULATED / PAPER</span></td><td>All liquidity is paper points in this sandbox. There is no real order book and no real counterparty on the other side of any trade.</td></tr>
+<tr><td>Best buyer lead (verified, Phase 1)</td><td>CoreWeave at eStruxture CAL-3</td><td>Rocky View County, 90 MW, Tier III, CoreWeave anchor tenant since 14 May 2026 — the only operating grid-connected GPU load in Alberta. Not contacted; not a commitment.</td></tr>
+</table>
+<h3>Onboarding path — what has to happen before real suppliers plug in</h3>
+<ol>
+<li><b>AESO written permission</b> for commercial use of its data (there is no open-data licence; the sandbox is non-commercial research).</li>
+<li><b>Market participation:</b> register as an AESO pool participant, or be appointed agent of a registered pool participant (ISO Rule 201.2) — about 3 months.</li>
+<li><b>Bilateral outreach</b> to Alberta power suppliers and grid-connected data centres (CAL-3/CoreWeave first), with real flexibility contracts and settlement terms.</li>
+<li><b>Mainnet HCS anchoring</b> (owner decision) and a durable, monitored deployment — the sandbox's local log becomes a Hedera-anchored audit trail.</li>
+<li><b>Real liquidity:</b> counterparties posting real bids/offers. Until then, every price here is a paper LMSR quote, not a market.</li>
+</ol>
+<p class="dim">Market context (verified Nov 11, 2026, The Block): Apex Group — $3.5T under administration — joined the Hedera Council to explore tokenization and settlement. Institutional tokenization is moving from experiment to adoption; it does not change anything in this sandbox.</p>
+</section>
+
+<section>
+<h2>How real is this?</h2>
+<table>
+<tr><th>Piece</th><th>Real</th><th>Why</th></tr>
+<tr><td>LMSR pricing</td><td><b>Real</b></td><td>Ported 1:1 from joulex/lmsr.py; 300 randomized cases match the Python module exactly (trade costs exact to the cent of a point; buy-then-sell round trips return the cost exactly).</td></tr>
+<tr><td>Market / order / settlement rules</td><td><b>Real</b></td><td>Same validation, balance, position, payout and fail-closed rules as joulex/markets.py, exchange.py and ledger.py; exercised end-to-end in tests/exercise.cjs.</td></tr>
+<tr><td>Flexibility scheduler</td><td><b>Real algorithm</b></td><td>Ported 1:1 from joulex/orchestrator.py; costs, SLA and allocations match the Python run_simulation exactly on the same jobs.</td></tr>
+<tr><td>Live AESO snapshot</td><td><b>Real observed data</b></td><td>4 hourly pool prices fetched from the public ETS report Nov 12, 2026 and parsed with the oracle's own code. A snapshot, not a stream.</td></tr>
+<tr><td>14-day price series</td><td><span class="pill synth">SYNTHETIC</span></td><td>Built from verified 2025 AESO statistics (mean $43.68/MWh, 10.6% zero-price hours, $999.99 cap). Labelled everywhere it appears.</td></tr>
+<tr><td>Traders, liquidity, counterparties</td><td><span class="pill paper">SIMULATED</span></td><td>You, alice and bob are paper agents. No real supplier or data centre is on the other side.</td></tr>
+<tr><td>HCS audit log</td><td><span class="pill paper">LOCAL SIMULATION</span></td><td>Same schema and hash chain as joulex/hcs.py LocalHCS, but no Hedera submission. Live path: testnet topic 0.0.11399235.</td></tr>
+<tr><td>Admission &amp; attestation</td><td><span class="pill paper">BYPASSED</span></td><td>Production requires CF-KYA L3 admission and, for settlement, the operator key + a valid attestation envelope. The sandbox has neither; that is the gap the production system closes.</td></tr>
+</table>
+</section>
+</main>
+<footer>
+JouleX sandbox — non-commercial research prototype. AESO data is free to access; commercial use needs AESO's written permission (aeso.ca/legal). Sources: joulex/lmsr.py, markets.py, ledger.py, exchange.py, orchestrator.py, aeso.py, aeso_synthetic.py, hcs.py; research_notes/joulex-phase1-20261109.md. No key material anywhere in this page. Suite: 334 passed (Nov 12, 2026).
+</footer>
+<script>/* LMSR port — line-for-line from joulex/lmsr.py (M6 generalized rule).
+ *
+ * The binary market is the N=2 case of the same functions. All point
+ * amounts are rounded to 6 decimal places at the trade boundary, so a
+ * buy-then-sell round trip returns the cost exactly — same rule as
+ * Python. Rounding is Python round-half-even (banker's), not JS
+ * Math.round, so costs match the Python module bit-for-bit.
+ *
+ * UMD: works as a browser global (window.JoulexLMSR) and as a Node
+ * module (module.exports). No DOM, no network.
+ */
+(function (root, factory) {
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = factory();
+  } else {
+    root.JoulexLMSR = factory();
+  }
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var DEFAULT_B = 100.0;
+  var MONEY_DP = 6;
+
+  // Python round(x, dp): ties to even. Mirrors CPython for the finite
+  // doubles this module ever sees.
+  function pyRound(value, dp) {
+    var p = Math.pow(10, dp);
+    var n = value * p;
+    var f = Math.floor(n);
+    var diff = n - f;
+    if (diff > 0.5) return (f + 1) / p;
+    if (diff < 0.5) return f / p;
+    // Exact tie: round to even.
+    return (f % 2 === 0 ? f : f + 1) / p;
+  }
+
+  function roundMoney(value) {
+    return pyRound(value, MONEY_DP);
+  }
+
+  function costFunctionMulti(q, b) {
+    if (b === undefined) b = DEFAULT_B;
+    if (b <= 0) throw new Error("liquidity parameter b must be > 0");
+    if (q.length < 2) throw new Error("multi-outcome LMSR needs at least 2 outcomes");
+    var m = -Infinity;
+    var i;
+    for (i = 0; i < q.length; i++) m = Math.max(m, q[i] / b);
+    var s = 0;
+    for (i = 0; i < q.length; i++) s += Math.exp(q[i] / b - m);
+    return b * (m + Math.log(s));
+  }
+
+  function pricesMulti(q, b) {
+    if (b === undefined) b = DEFAULT_B;
+    if (b <= 0) throw new Error("liquidity parameter b must be > 0");
+    if (q.length < 2) throw new Error("multi-outcome LMSR needs at least 2 outcomes");
+    var m = -Infinity;
+    var i;
+    for (i = 0; i < q.length; i++) m = Math.max(m, q[i] / b);
+    var weights = [];
+    var total = 0;
+    for (i = 0; i < q.length; i++) {
+      var w = Math.exp(q[i] / b - m);
+      weights.push(w);
+      total += w;
+    }
+    return weights.map(function (w) { return w / total; });
+  }
+
+  function applyTradeMulti(q, index, shares) {
+    if (!(index >= 0 && index < q.length)) {
+      throw new Error("outcome index " + index + " out of range for " + q.length + " outcomes");
+    }
+    var out = q.slice();
+    out[index] = out[index] + shares;
+    return out;
+  }
+
+  function tradeCostMulti(q, b, index, shares) {
+    if (!(index >= 0 && index < q.length)) {
+      throw new Error("outcome index " + index + " out of range for " + q.length + " outcomes");
+    }
+    var newQ = applyTradeMulti(q, index, shares);
+    return roundMoney(costFunctionMulti(newQ, b) - costFunctionMulti(q, b));
+  }
+
+  // Binary specializations (exact, same arithmetic as the multi path).
+  function costFunction(qYes, qNo, b) {
+    return costFunctionMulti([qYes, qNo], b === undefined ? DEFAULT_B : b);
+  }
+
+  function priceYes(qYes, qNo, b) {
+    return pricesMulti([qYes, qNo], b === undefined ? DEFAULT_B : b)[0];
+  }
+
+  function tradeCost(qYes, qNo, b, side, shares) {
+    var idx = side === "YES" ? 0 : side === "NO" ? 1 : -1;
+    if (idx < 0) throw new Error("side must be YES or NO, got " + JSON.stringify(side));
+    return tradeCostMulti([qYes, qNo], b, idx, shares);
+  }
+
+  return {
+    DEFAULT_B: DEFAULT_B,
+    MONEY_DP: MONEY_DP,
+    pyRound: pyRound,
+    roundMoney: roundMoney,
+    costFunctionMulti: costFunctionMulti,
+    pricesMulti: pricesMulti,
+    applyTradeMulti: applyTradeMulti,
+    tradeCostMulti: tradeCostMulti,
+    costFunction: costFunction,
+    priceYes: priceYes,
+    tradeCost: tradeCost
+  };
+});
+</script>
+<script>/* Synchronous SHA-256 + JCS-style canonical JSON.
+ *
+ * canonical_bytes in joulex/attestation.py is json.dumps(sort_keys=True,
+ * separators=(",", ":")) — this file mirrors it exactly, including
+ * Python float formatting (repr shortest-round-trip; scientific
+ * notation below 1e-4 / at or above 1e16, exponent zero-padded to two
+ * digits), so payload hashes computed here match the Python module's
+ * for the same payload. Verified against Python in tests/parity.mjs.
+ *
+ * The SHA-256 below is a standard compact implementation (FIPS 180-4);
+ * verified against Node's crypto in tests/parity.mjs. It is synchronous
+ * so the audit log can append in one call in both the browser and Node.
+ *
+ * UMD: browser global window.JoulexHash, Node module.exports.
+ */
+(function (root, factory) {
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = factory();
+  } else {
+    root.JoulexHash = factory();
+  }
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  // -- SHA-256 (FIPS 180-4) -------------------------------------------
+  var K = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+    0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+    0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+    0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+    0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+    0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+    0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+    0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+    0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ];
+
+  function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+  function sha256Hex(str) {
+    // UTF-8 encode.
+    var bytes = [];
+    for (var i = 0; i < str.length; i++) {
+      var c = str.charCodeAt(i);
+      if (c < 0x80) bytes.push(c);
+      else if (c < 0x800) { bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f)); }
+      else if (c >= 0xd800 && c < 0xdc00) {
+        var c2 = str.charCodeAt(++i);
+        var cp = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
+        bytes.push(0xf0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3f),
+                   0x80 | ((cp >> 6) & 0x3f), 0x80 | (cp & 0x3f));
+      } else {
+        bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+      }
+    }
+    var bitLen = bytes.length * 8;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    // 64-bit length, big-endian (message is far below 2^32 bits).
+    bytes.push(0, 0, 0, 0, (bitLen >>> 24) & 0xff, (bitLen >>> 16) & 0xff,
+               (bitLen >>> 8) & 0xff, bitLen & 0xff);
+
+    var h = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var w = new Array(64);
+    for (var off = 0; off < bytes.length; off += 64) {
+      for (var t = 0; t < 16; t++) {
+        w[t] = ((bytes[off + t * 4] << 24) | (bytes[off + t * 4 + 1] << 16) |
+                (bytes[off + t * 4 + 2] << 8) | bytes[off + t * 4 + 3]) >>> 0;
+      }
+      for (t = 16; t < 64; t++) {
+        var s0 = (rotr(w[t - 15], 7) ^ rotr(w[t - 15], 18) ^ (w[t - 15] >>> 3)) >>> 0;
+        var s1 = (rotr(w[t - 2], 17) ^ rotr(w[t - 2], 19) ^ (w[t - 2] >>> 10)) >>> 0;
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) >>> 0;
+      }
+      var a = h[0], b = h[1], c2 = h[2], d = h[3];
+      var e = h[4], f = h[5], g = h[6], hh = h[7];
+      for (t = 0; t < 64; t++) {
+        var S1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0;
+        var ch = ((e & f) ^ (~e & g)) >>> 0;
+        var t1 = (hh + S1 + ch + K[t] + w[t]) >>> 0;
+        var S0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0;
+        var maj = ((a & b) ^ (a & c2) ^ (b & c2)) >>> 0;
+        var t2 = (S0 + maj) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0;
+        d = c2; c2 = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0;
+      h[2] = (h[2] + c2) >>> 0; h[3] = (h[3] + d) >>> 0;
+      h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0;
+      h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+    }
+    var out = "";
+    for (var j = 0; j < 8; j++) {
+      out += ("00000000" + (h[j] >>> 0).toString(16)).slice(-8);
+    }
+    return out;
+  }
+
+  // -- Python-compatible float formatting -------------------------------
+  // CPython repr(float): shortest string that round-trips; scientific
+  // notation when |x| < 1e-4 or >= 1e16, exponent with sign and at
+  // least two digits (1e-06, 1e+16). JS String() differs exactly
+  // there (0.000001, 1e-6), so translate.
+  function pyFloat(x) {
+    if (x === 0) return "0.0";
+    if (!isFinite(x)) return x > 0 ? "Infinity" : "-Infinity";
+    if (Number.isInteger(x) && Math.abs(x) < 1e16) return x.toFixed(1);
+    var ax = Math.abs(x);
+    if (ax < 1e-4 || ax >= 1e16) {
+      var exp = x.toExponential(); // e.g. "1e-6", "1.5e+21"
+      var parts = exp.split("e");
+      var mant = parts[0];
+      var e = parseInt(parts[1], 10);
+      var sign = e < 0 ? "-" : "+";
+      var digits = String(Math.abs(e));
+      if (digits.length < 2) digits = "0" + digits;
+      return mant + "e" + sign + digits;
+    }
+    return String(x);
+  }
+
+  // -- JCS-style canonical JSON -----------------------------------------
+  // json.dumps(data, sort_keys=True, separators=(",", ":")) with the
+  // DEFAULT ensure_ascii=True: every non-ASCII code unit is escaped
+  // as \uXXXX (astral characters become surrogate-pair escapes).
+  // JSON.stringify leaves non-ASCII raw, so translate after stringify.
+  function pyString(s) {
+    var out = JSON.stringify(s);
+    var res = "";
+    for (var i = 0; i < out.length; i++) {
+      var code = out.charCodeAt(i);
+      if (code > 0x7e) {
+        res += "\\u" + ("0000" + code.toString(16)).slice(-4);
+      } else {
+        res += out[i];
+      }
+    }
+    return res;
+  }
+
+  function canonical(data) {
+    if (data === null || data === undefined) return "null";
+    if (typeof data === "number") return pyFloat(data);
+    if (typeof data === "boolean") return data ? "true" : "false";
+    if (typeof data === "string") return pyString(data);
+    if (Array.isArray(data)) {
+      return "[" + data.map(canonical).join(",") + "]";
+    }
+    var keys = Object.keys(data).sort();
+    var parts = [];
+    for (var i = 0; i < keys.length; i++) {
+      parts.push(pyString(keys[i]) + ":" + canonical(data[keys[i]]));
+    }
+    return "{" + parts.join(",") + "}";
+  }
+
+  function sha256Canonical(data) {
+    return sha256Hex(canonical(data));
+  }
+
+  return {
+    sha256Hex: sha256Hex,
+    pyFloat: pyFloat,
+    pyString: pyString,
+    canonical: canonical,
+    sha256Canonical: sha256Canonical
+  };
+});
+</script>
+<script>/* Orchestrator port — line-for-line from joulex/orchestrator.py (M2).
+ *
+ * Same schedulers, same rules, same verdict: GO iff improvement vs
+ * greedy >= 5% net of coordination cost AND SLA 100% AND every
+ * allocation decision audited (100% — in the sandbox the audit is the
+ * local HCS log; the engine records each decision there).
+ *
+ * Prices are [timestampISO, price] pairs; jobs are
+ * {job_id, hours, power_mw, earliest_start, deadline} with slot
+ * indices into the price series. Capacity is a per-hour power cap
+ * (default 1.0 MW). Coordination cost $0.01/decision (one decision
+ * per allocated job). All comparisons mirror the Python exactly,
+ * including sort orders and tie-breaks, so results match the Python
+ * run_simulation on the same inputs (verified in tests/parity.mjs).
+ *
+ * UMD: browser global window.JoulexOrchestrator, Node module.exports.
+ */
+(function (root, factory) {
+  if (typeof module !== "undefined" && module.exports) {
+    module.exports = factory();
+  } else {
+    root.JoulexOrchestrator = factory();
+  }
+})(typeof self !== "undefined" ? self : this, function () {
+  "use strict";
+
+  var DEFAULT_COORDINATION_COST_PER_DECISION = 0.01;
+  var DEFAULT_CAPACITY_MW = 1.0;
+  var IMPROVEMENT_TARGET_PCT = 5.0;
+  var SLA_TARGET_PCT = 100.0;
+
+  function validate(prices, jobs) {
+    if (!prices || prices.length === 0) {
+      throw new Error("no price history: refusing to simulate");
+    }
+    for (var i = 0; i < prices.length; i++) {
+      if (prices[i][1] < 0) throw new Error("negative pool price in history");
+    }
+    jobs.forEach(function (job) {
+      ["job_id", "hours", "power_mw", "earliest_start", "deadline"].forEach(function (k) {
+        if (!(k in job)) throw new Error("job " + (job.job_id || "?") + " missing '" + k + "'");
+      });
+      if (job.hours <= 0 || job.power_mw <= 0) {
+        throw new Error("job " + job.job_id + ": hours and power_mw must be > 0");
+      }
+      if (!(job.earliest_start >= 0 && job.earliest_start < job.deadline &&
+            job.deadline <= prices.length)) {
+        throw new Error("job " + job.job_id + ": window [" + job.earliest_start + ", " +
+          job.deadline + ") outside the " + prices.length + "-hour history");
+      }
+    });
+  }
+
+  function priceAt(prices, hour) { return prices[hour][1]; }
+
+  function allocationCost(prices, jobs, alloc) {
+    var byId = {};
+    jobs.forEach(function (j) { byId[j.job_id] = j; });
+    var total = 0;
+    Object.keys(alloc).forEach(function (jobId) {
+      var job = byId[jobId];
+      alloc[jobId].forEach(function (h) { total += priceAt(prices, h) * job.power_mw; });
+    });
+    return total;
+  }
+
+  function allocationEnergyMwh(jobs, alloc) {
+    var byId = {};
+    jobs.forEach(function (j) { byId[j.job_id] = j; });
+    var total = 0;
+    Object.keys(alloc).forEach(function (jobId) {
+      total += alloc[jobId].length * byId[jobId].power_mw;
+    });
+    return total;
+  }
+
+  function slaPct(jobs, alloc) {
+    if (jobs.length === 0) return 100.0;
+    var met = 0;
+    jobs.forEach(function (job) {
+      var hours = alloc[job.job_id] || [];
+      var ok = hours.length === job.hours && hours.every(function (h) {
+        return h >= job.earliest_start && h < job.deadline;
+      });
+      if (ok) met++;
+    });
+    return 100.0 * met / jobs.length;
+  }
+
+  function scheduleFixed(prices, jobs, capacityMw) {
+    validate(prices, jobs);
+    var alloc = {};
+    jobs.forEach(function (job) {
+      var hours = [];
+      for (var h = job.earliest_start; h < job.earliest_start + job.hours; h++) {
+        if (h < prices.length) hours.push(h);
+      }
+      alloc[job.job_id] = hours;
+    });
+    return alloc;
+  }
+
+  function schedulePriceOnly(prices, jobs, capacityMw) {
+    validate(prices, jobs);
+    var cheapest = [];
+    for (var h = 0; h < prices.length; h++) cheapest.push(h);
+    cheapest.sort(function (a, b) {
+      var d = priceAt(prices, a) - priceAt(prices, b);
+      return d !== 0 ? d : a - b;
+    });
+    var alloc = {};
+    jobs.forEach(function (job) {
+      alloc[job.job_id] = cheapest.slice(0, job.hours).slice().sort(function (a, b) { return a - b; });
+    });
+    return alloc;
+  }
+
+  function usedMw(alloc, jobs) {
+    var byId = {};
+    jobs.forEach(function (j) { byId[j.job_id] = j; });
+    var used = {};
+    Object.keys(alloc).forEach(function (jobId) {
+      alloc[jobId].forEach(function (h) {
+        used[h] = (used[h] || 0) + byId[jobId].power_mw;
+      });
+    });
+    return used;
+  }
+
+  function cheapestFeasible(prices, job, used, capacityMw, k) {
+    var candidates = [];
+    for (var h = job.earliest_start; h < job.deadline; h++) {
+      if ((used[h] || 0) + job.power_mw <= capacityMw + 1e-9) candidates.push(h);
+    }
+    candidates.sort(function (a, b) {
+      var d = priceAt(prices, a) - priceAt(prices, b);
+      return d !== 0 ? d : a - b;
+    });
+    return candidates.slice(0, k).sort(function (a, b) { return a - b; });
+  }
+
+  function assignInOrder(prices, jobs, order, capacityMw) {
+    var alloc = {};
+    jobs.forEach(function (j) { alloc[j.job_id] = []; });
+    var used = {};
+    order.forEach(function (job) {
+      var hours = cheapestFeasible(prices, job, used, capacityMw, job.hours);
+      alloc[job.job_id] = hours;
+      hours.forEach(function (h) { used[h] = (used[h] || 0) + job.power_mw; });
+    });
+    return alloc;
+  }
+
+  function scheduleGreedy(prices, jobs, capacityMw) {
+    if (capacityMw === undefined) capacityMw = DEFAULT_CAPACITY_MW;
+    validate(prices, jobs);
+    var order = jobs.slice().sort(function (a, b) {
+      if (a.deadline !== b.deadline) return a.deadline - b.deadline;
+      return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
+    });
+    return assignInOrder(prices, jobs, order, capacityMw);
+  }
+
+  function improve(prices, jobs, alloc, capacityMw) {
+    var out = {};
+    Object.keys(alloc).forEach(function (k) { out[k] = alloc[k].slice().sort(function (a, b) { return a - b; }); });
+    var byId = {};
+    jobs.forEach(function (j) { byId[j.job_id] = j; });
+    var sortedJobs = jobs.slice().sort(function (a, b) {
+      return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
+    });
+    for (var pass = 0; pass < 20; pass++) {
+      var improved = false;
+      var used = usedMw(out, jobs);
+      // Single-hour moves.
+      sortedJobs.forEach(function (job) {
+        var jobId = job.job_id;
+        out[jobId].slice().forEach(function (h) {
+          for (var cand = job.earliest_start; cand < job.deadline; cand++) {
+            if (out[jobId].indexOf(cand) !== -1) continue;
+            if (priceAt(prices, cand) >= priceAt(prices, h)) continue;
+            if ((used[cand] || 0) + job.power_mw > capacityMw + 1e-9) continue;
+            out[jobId].splice(out[jobId].indexOf(h), 1);
+            out[jobId].push(cand);
+            out[jobId].sort(function (a, b) { return a - b; });
+            used[h] -= job.power_mw;
+            used[cand] = (used[cand] || 0) + job.power_mw;
+            improved = true;
+            break;
+          }
+        });
+      });
+      // Pairwise swaps.
+      for (var i = 0; i < sortedJobs.length; i++) {
+        for (var j = i + 1; j < sortedJobs.length; j++) {
+          var jobA = sortedJobs[i], jobB = sortedJobs[j];
+          var aId = jobA.job_id, bId = jobB.job_id;
+          out[aId].slice().forEach(function (hA) {
+            out[bId].slice().forEach(function (hB) {
+              if (out[aId].indexOf(hA) === -1 || out[bId].indexOf(hB) === -1) return;
+              if (out[aId].indexOf(hB) !== -1 || out[bId].indexOf(hA) !== -1) return;
+              if (!(jobA.earliest_start <= hB && hB < jobA.deadline &&
+                    jobB.earliest_start <= hA && hA < jobB.deadline)) return;
+              var before = priceAt(prices, hA) * jobA.power_mw +
+                           priceAt(prices, hB) * jobB.power_mw;
+              var after = priceAt(prices, hB) * jobA.power_mw +
+                          priceAt(prices, hA) * jobB.power_mw;
+              if (after < before - 1e-9) {
+                out[aId].splice(out[aId].indexOf(hA), 1);
+                out[aId].push(hB);
+                out[aId].sort(function (a, b) { return a - b; });
+                out[bId].splice(out[bId].indexOf(hB), 1);
+                out[bId].push(hA);
+                out[bId].sort(function (a, b) { return a - b; });
+                improved = true;
+              }
+            });
+          });
+        }
+      }
+      if (!improved) break;
+    }
+    return out;
+  }
+
+  function scheduleOrchestrator(prices, jobs, capacityMw) {
+    if (capacityMw === undefined) capacityMw = DEFAULT_CAPACITY_MW;
+    validate(prices, jobs);
+    var greedy = scheduleGreedy(prices, jobs, capacityMw);
+    var slackOrder = jobs.slice().sort(function (a, b) {
+      var sa = a.deadline - a.earliest_start - a.hours;
+      var sb = b.deadline - b.earliest_start - b.hours;
+      if (sa !== sb) return sa - sb;
+      return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
+    });
+    var slackAlloc = assignInOrder(prices, jobs, slackOrder, capacityMw);
+    var candidates = [
+      improve(prices, jobs, greedy, capacityMw),
+      improve(prices, jobs, slackAlloc, capacityMw)
+    ];
+    var best = candidates[0];
+    var bestCost = allocationCost(prices, jobs, best);
+    var bestKey = JSON.stringify(Object.keys(best).sort().map(function (k) { return [k, best[k]]; }));
+    for (var i = 1; i < candidates.length; i++) {
+      var c = allocationCost(prices, jobs, candidates[i]);
+      var cKey = JSON.stringify(Object.keys(candidates[i]).sort().map(function (k) { return [k, candidates[i][k]]; }));
+      if (c < bestCost || (c === bestCost && cKey < bestKey)) {
+        best = candidates[i]; bestCost = c; bestKey = cKey;
+      }
+    }
+    return best;
+  }
+
+  function round6(x) { return Math.round(x * 1e6) / 1e6; }
+
+  function improvementPct(baseline, net) {
+    if (baseline <= 0) return 0.0;
+    return 100.0 * (baseline - net) / baseline;
+  }
+
+  // Full simulation scoring — mirrors orchestrator.run_simulation
+  // minus the HCS audit (the engine logs decisions separately).
+  function runSimulation(prices, jobs, opts) {
+    opts = opts || {};
+    var capacityMw = opts.capacityMw === undefined ? DEFAULT_CAPACITY_MW : opts.capacityMw;
+    var coordPerDecision = opts.coordinationCostPerDecision === undefined ?
+      DEFAULT_COORDINATION_COST_PER_DECISION : opts.coordinationCostPerDecision;
+    validate(prices, jobs);
+    var allocs = {
+      fixed: scheduleFixed(prices, jobs, capacityMw),
+      price_only: schedulePriceOnly(prices, jobs, capacityMw),
+      greedy: scheduleGreedy(prices, jobs, capacityMw),
+      orchestrator: scheduleOrchestrator(prices, jobs, capacityMw)
+    };
+    var costs = {};
+    Object.keys(allocs).forEach(function (name) {
+      costs[name] = allocationCost(prices, jobs, allocs[name]);
+    });
+    var slas = {};
+    Object.keys(allocs).forEach(function (name) {
+      slas[name] = slaPct(jobs, allocs[name]);
+    });
+    var orchAlloc = allocs.orchestrator;
+    var decisions = 0;
+    Object.keys(orchAlloc).forEach(function (k) { if (orchAlloc[k].length) decisions++; });
+    var coordTotal = decisions * coordPerDecision;
+    var energy = costs.orchestrator;
+    var net = energy + coordTotal;
+    costs.orchestrator_energy = energy;
+    costs.orchestrator_net = net;
+    var improvement = {
+      vs_fixed: improvementPct(costs.fixed, net),
+      vs_price_only: improvementPct(costs.price_only, net),
+      vs_greedy: improvementPct(costs.greedy, net)
+    };
+    var periodDays = prices.length / 24.0;
+    var energyMwh = allocationEnergyMwh(jobs, orchAlloc);
+    var savingVsFixed = costs.fixed - net;
+    var savingPerMwh = energyMwh > 0 ? savingVsFixed / energyMwh : 0.0;
+    var reasons = [];
+    var go = true;
+    if (improvement.vs_greedy < IMPROVEMENT_TARGET_PCT) {
+      go = false;
+      reasons.push("improvement vs greedy " + improvement.vs_greedy.toFixed(2) +
+        "% < " + IMPROVEMENT_TARGET_PCT + "% target");
+    }
+    if (slas.orchestrator < SLA_TARGET_PCT) {
+      go = false;
+      reasons.push("orchestrator SLA " + slas.orchestrator.toFixed(1) + "% < " +
+        SLA_TARGET_PCT + "% target");
+    }
+    var verdict = go ? "GO" : "NO-GO";
+    var verdictReason = go ?
+      "meets all V0 targets: improvement vs greedy " +
+        improvement.vs_greedy.toFixed(2) + "% >= 5%, SLA 100%, 100% auditable" :
+      reasons.join("; ");
+    return {
+      source_label: opts.sourceLabel || "SYNTHETIC",
+      n_hours: prices.length,
+      n_jobs: jobs.length,
+      capacity_mw: capacityMw,
+      costs: { fixed: round6(costs.fixed), price_only: round6(costs.price_only),
+               greedy: round6(costs.greedy), orchestrator: round6(energy),
+               orchestrator_energy: round6(energy),
+               orchestrator_net: round6(net) },
+      coordination_cost: { per_decision: coordPerDecision, decisions: decisions,
+                           total: round6(coordTotal) },
+      improvement_pct: { vs_fixed: Math.round(improvement.vs_fixed * 100) / 100,
+                         vs_price_only: Math.round(improvement.vs_price_only * 100) / 100,
+                         vs_greedy: Math.round(improvement.vs_greedy * 100) / 100 },
+      sla_pct: slas,
+      verdict: verdict,
+      verdict_reason: verdictReason,
+      annualised: {
+        period_days: periodDays,
+        energy_mwh: Math.round(energyMwh * 100) / 100,
+        saving_vs_fixed_usd: Math.round(savingVsFixed * 100) / 100,
+        saving_per_mwh: Math.round(savingPerMwh * 100) / 100,
+        saving_per_year_usd: Math.round(savingVsFixed * (365.0 / periodDays) * 100) / 100
+      },
+      allocations: allocs
+    };
+  }
+
+  return {
+    DEFAULT_COORDINATION_COST_PER_DECISION: DEFAULT_COORDINATION_COST_PER_DECISION,
+    DEFAULT_CAPACITY_MW: DEFAULT_CAPACITY_MW,
+    IMPROVEMENT_TARGET_PCT: IMPROVEMENT_TARGET_PCT,
+    SLA_TARGET_PCT: SLA_TARGET_PCT,
+    validate: validate,
+    allocationCost: allocationCost,
+    allocationEnergyMwh: allocationEnergyMwh,
+    slaPct: slaPct,
+    scheduleFixed: scheduleFixed,
+    schedulePriceOnly: schedulePriceOnly,
+    scheduleGreedy: scheduleGreedy,
+    scheduleOrchestrator: scheduleOrchestrator,
+    runSimulation: runSimulation
+  };
+});
+</script>
+<script>/* Sandbox exchange engine — the JouleX core rules, ported from
+ * joulex/exchange.py + joulex/markets.py + joulex/ledger.py +
+ * joulex/hcs.py (LocalHCS) + joulex/aeso.py (oracle rule).
+ *
+ * What is the SAME as production code:
+ *  - LMSR pricing (via JoulexLMSR — the port of joulex/lmsr.py)
+ *  - Market validation rules (joulex/markets.py new_market)
+ *  - Order checks: open market, side valid, sell-position check,
+ *    balance check, cost = C(q+delta) - C(q), 6dp rounding
+ *  - Ledger rules (joulex/ledger.py): 1,000-point endowment, pool as
+ *    market-maker account, 1 point per winning share at settlement,
+ *    conservation invariant sum(balances) + pool == 1000 * agents
+ *  - Settlement rules (joulex/markets.py resolve_outcome): aeso_price
+ *    YES iff max hourly pool price over the window > strike (tie = NO);
+ *    public_source outcome must be one of the market's outcomes
+ *  - Oracle fail-closed (joulex/aeso.py): a window the series does
+ *    not cover is a NO_DATA refusal — the market stays OPEN, no
+ *    outcome is ever guessed
+ *  - HCS log schema (joulex/hcs.py LocalHCS): header
+ *    {"mode": "local", "hedera_topic": null}, strictly increasing
+ *    sequence, consensus timestamp in HCS nanosecond format, sender,
+ *    action, payload hash, attestation, provenance, hash chain.
+ *    The timestamp is a LOCAL simulation of a consensus timestamp,
+ *    never a Hedera consensus timestamp.
+ *
+ * What is DELIBERATELY different (sandbox only — labelled in the UI):
+ *  - NO CF-KYA admission: the visitor trades as a named sandbox
+ *    agent with no credential. Production requires L3 admission.
+ *  - NO operator key / attestation on settlement: the visitor acts
+ *    as sandbox operator. Production /settle requires the operator
+ *    key and, for public_source, a valid attestation envelope.
+ *  - NO Hedera submission: the log is local-only. The live path is
+ *    Hedera testnet topic 0.0.11399235; this sandbox never submits.
+ *  - Paper points only. No real money, power, or counterparties.
+ *
+ * UMD: browser global window.JoulexEngine, Node module.exports.
+ * Depends on JoulexLMSR and JoulexHash (required in Node, read from
+ * window in the browser). No DOM, no network. Pure state machine.
+ */
+(function (root, factory) {
+  var LMSR, Hash;
+  if (typeof module !== "undefined" && module.exports) {
+    LMSR = require("./lmsr.js");
+    Hash = require("./sha256.js");
+    module.exports = factory(LMSR, Hash);
+  } else {
+    root.JoulexEngine = factory(root.JoulexLMSR, root.JoulexHash);
+  }
+})(typeof self !== "undefined" ? self : this, function (LMSR, Hash) {
+  "use strict";
+
+  var STARTING_POINTS = 1000.0;
+  var GENESIS_PREV_HASH = "0000000000000000000000000000000000000000000000000000000000000000";
+  var MIN_RESOLVE_MS = 24 * 3600 * 1000;
+  var MAX_RESOLVE_MS = 30 * 24 * 3600 * 1000;
+  var RESOLUTION_TYPES = ["aeso_price", "public_source"];
+  var CONTRACT_TYPES = ["flex_capacity", "compute_forward", "generic"];
+  var BINARY_OUTCOMES = ["YES", "NO"];
+
+  function EngineError(status, reason) {
+    var e = new Error(status + ": " + reason);
+    e.status = status;
+    e.reason = reason;
+    return e;
+  }
+
+  function r6(v) { return LMSR.roundMoney(v); }
+
+  function parseTime(value) {
+    var d = new Date(value);
+    if (isNaN(d.getTime())) throw new Error("invalid timestamp: " + value);
+    return d;
+  }
+
+  // HCS nanosecond format, LOCAL simulation (joulex/hcs.py
+  // format_hcs_timestamp): microseconds * 1000, last three digits 0.
+  function formatHcsTimestamp(date) {
+    function p(n, l) { var s = String(n); while (s.length < l) s = "0" + s; return s; }
+    return date.getUTCFullYear() + "-" + p(date.getUTCMonth() + 1, 2) + "-" +
+      p(date.getUTCDate(), 2) + "T" + p(date.getUTCHours(), 2) + ":" +
+      p(date.getUTCMinutes(), 2) + ":" + p(date.getUTCSeconds(), 2) + "." +
+      p(date.getUTCMilliseconds(), 3) + "000000Z";
+  }
+
+  // -- market validation (mirrors joulex/markets.py new_market) --------
+  function normalizeOutcomes(outcomes) {
+    if (outcomes === null || outcomes === undefined) return BINARY_OUTCOMES.slice();
+    if (!Array.isArray(outcomes)) throw new Error("outcomes must be a list of outcome labels");
+    if (outcomes.length < 2) throw new Error("outcomes must list at least 2 outcomes");
+    if (outcomes.length > 10) throw new Error("outcomes must list at most 10 outcomes");
+    var labels = outcomes.map(function (label) {
+      if (typeof label !== "string") throw new Error("outcome labels must be strings");
+      label = label.trim();
+      if (!label) throw new Error("outcome labels must be non-empty");
+      if (label.length > 64) throw new Error("outcome labels must be at most 64 characters");
+      if (label.indexOf("|") !== -1) throw new Error("outcome labels must not contain '|'");
+      return label;
+    });
+    if (new Set(labels).size !== labels.length) throw new Error("outcome labels must be distinct");
+    var lowered = labels.map(function (l) { return l.toLowerCase(); });
+    if (lowered.length === 2 && lowered.indexOf("yes") !== -1 && lowered.indexOf("no") !== -1) {
+      return BINARY_OUTCOMES.slice();
+    }
+    return labels;
+  }
+
+  function newMarket(fields, now) {
+    var question = fields.question;
+    if (!question || !String(question).trim()) throw new Error("question must be non-empty");
+    if (RESOLUTION_TYPES.indexOf(fields.resolution_type) === -1) {
+      throw new Error("resolution_type must be one of " + RESOLUTION_TYPES.join(", "));
+    }
+    var contractType = fields.contract_type || "generic";
+    if (CONTRACT_TYPES.indexOf(contractType) === -1) {
+      throw new Error("contract_type must be one of " + CONTRACT_TYPES.join(", "));
+    }
+    var resolves = parseTime(fields.resolves_at);
+    var horizon = resolves.getTime() - now.getTime();
+    if (horizon < MIN_RESOLVE_MS) throw new Error("resolves_at must be at least 1 day in the future");
+    if (horizon > MAX_RESOLVE_MS) throw new Error("resolves_at must be at most 30 days in the future");
+    var b = fields.b === undefined ? 100.0 : Number(fields.b);
+    if (!(b > 0)) throw new Error("liquidity parameter b must be > 0");
+    var outcomes = normalizeOutcomes(fields.outcomes);
+    var strike = null, windowStart = null, windowEnd = null;
+    var sourceUrl = fields.source_url || null;
+    var sourceDesc = fields.source_description || null;
+    if (fields.resolution_type === "aeso_price") {
+      if (outcomes.join("|") !== BINARY_OUTCOMES.join("|")) {
+        throw new Error("aeso_price markets are binary (outcomes YES/NO only)");
+      }
+      if (fields.strike === null || fields.strike === undefined) {
+        throw new Error("aeso_price markets require strike");
+      }
+      strike = Number(fields.strike);
+      if (isNaN(strike)) throw new Error("strike must be a number");
+      if (!fields.window_start || !fields.window_end) {
+        throw new Error("aeso_price markets require window_start and window_end");
+      }
+      var start = parseTime(fields.window_start);
+      var end = parseTime(fields.window_end);
+      if (end <= start) throw new Error("window_end must be after window_start");
+      windowStart = start.toISOString();
+      windowEnd = end.toISOString();
+      sourceUrl = "http://ets.aeso.ca/ets_web/ip/Market/Reports/CSMPriceReportServlet?contentType=csv";
+      sourceDesc = "AESO System Marginal Price (minute), averaged to hourly pool " +
+        "price over [" + windowStart + ", " + windowEnd + "); YES iff max hourly " +
+        "pool price > " + strike + " $/MWh";
+    } else {
+      if (!sourceUrl || !sourceUrl.trim()) throw new Error("public_source markets require source_url");
+      if (!sourceDesc || !sourceDesc.trim()) throw new Error("public_source markets require source_description");
+      windowStart = fields.window_start || null;
+      windowEnd = fields.window_end || null;
+    }
+    var n = outcomes.length;
+    var q = [];
+    for (var i = 0; i < n; i++) q.push(0);
+    var prices = LMSR.pricesMulti(q, b);
+    var priceMap = {};
+    outcomes.forEach(function (o, idx) { priceMap[o] = prices[idx]; });
+    var market = {
+      market_id: "mkt_" + Math.random().toString(16).slice(2, 14),
+      question: String(question).trim(),
+      resolution_type: fields.resolution_type,
+      contract_type: contractType,
+      strike: strike,
+      window_start: windowStart,
+      window_end: windowEnd,
+      resolution_source_url: sourceUrl,
+      resolution_source_description: sourceDesc,
+      resolves_at: resolves.toISOString(),
+      created_at: now.toISOString(),
+      b: b,
+      outcomes: outcomes,
+      q: q,
+      prices: priceMap,
+      status: "OPEN",
+      outcome: null,
+      observed_value: null,
+      evidence: null,
+      settled_at: null,
+      created_by: fields.created_by || "sandbox"
+    };
+    if (outcomes.join("|") === BINARY_OUTCOMES.join("|")) {
+      market.q_yes = 0; market.q_no = 0; market.price_yes = priceMap.YES;
+    }
+    return market;
+  }
+
+  function canTrade(market, now) {
+    if (market.status !== "OPEN") return [false, "MARKET_" + market.status];
+    if (now >= parseTime(market.resolves_at)) return [false, "MARKET_CLOSED"];
+    return [true, "OK"];
+  }
+
+  function canSettle(market, now) {
+    if (market.status !== "OPEN") return [false, "MARKET_" + market.status];
+    if (now < parseTime(market.resolves_at)) return [false, "MARKET_NOT_YET_RESOLVABLE"];
+    return [true, "OK"];
+  }
+
+  function resolveOutcome(market, observedValue, outcome) {
+    if (market.resolution_type === "aeso_price") {
+      if (observedValue === null || observedValue === undefined) {
+        throw new Error("aeso_price settlement requires observed_value");
+      }
+      return Number(observedValue) > Number(market.strike) ? "YES" : "NO";
+    }
+    if (market.outcomes.indexOf(outcome) === -1) {
+      throw new Error("public_source settlement outcome must be one of " + market.outcomes.join(", "));
+    }
+    return outcome;
+  }
+
+  // -- engine -----------------------------------------------------------
+  function createEngine(data) {
+    // data: { synthetic: {prices:[{timestamp,price}]}, live_snapshot: {hours:[...]},
+    //         seed_markets: [...], seed_trades: [...], sandbox_clock_start }
+    var state = {
+      clock: data.sandbox_clock_start,
+      agents: {},       // agent_id -> {balance}
+      positions: {},    // "agent|market|side" -> shares
+      pool: 0,
+      markets: {},
+      trades: [],
+      log: [],          // HCS-schema messages (local mode)
+      nextSeq: 1,
+      prevHash: GENESIS_PREV_HASH,
+      marketCounter: 0
+    };
+
+    function now() { return new Date(state.clock); }
+
+    function ensureAgent(agentId) {
+      if (!state.agents[agentId]) {
+        state.agents[agentId] = { balance: STARTING_POINTS };
+      }
+    }
+
+    function balance(agentId) {
+      return state.agents[agentId] ? state.agents[agentId].balance : 0;
+    }
+
+    function position(agentId, marketId, side) {
+      return state.positions[agentId + "|" + marketId + "|" + side] || 0;
+    }
+
+    function positionsFor(agentId) {
+      var out = [];
+      Object.keys(state.positions).sort().forEach(function (key) {
+        var parts = key.split("|");
+        if (parts[0] === agentId && Math.abs(state.positions[key]) > 1e-9) {
+          out.push({ market_id: parts[1], side: parts[2], shares: state.positions[key] });
+        }
+      });
+      return out;
+    }
+
+    // -- HCS local log (joulex/hcs.py LocalHCS schema) -----------------
+    function hcsAppend(sender, action, payload, provenance) {
+      var ts = formatHcsTimestamp(now());
+      var message = {
+        sequence: state.nextSeq,
+        consensus_timestamp: ts,
+        topic: "joulex-actions",
+        sender: sender,
+        action: action,
+        payload: payload,
+        payload_hash: Hash.sha256Canonical(payload),
+        attestation: null,
+        provenance: provenance || { told_by: "sandbox", known_facts: [] },
+        prev_hash: state.prevHash
+      };
+      message.message_hash = Hash.sha256Hex(Hash.canonical(message));
+      state.log.push(message);
+      state.prevHash = message.message_hash;
+      state.nextSeq += 1;
+      return message;
+    }
+
+    function verifyLog() {
+      var errors = [];
+      var prev = GENESIS_PREV_HASH;
+      for (var i = 0; i < state.log.length; i++) {
+        var m = state.log[i];
+        if (m.sequence !== i + 1) errors.push("seq break at index " + i);
+        if (m.prev_hash !== prev) errors.push("hash-chain break at seq " + m.sequence);
+        var body = {};
+        Object.keys(m).forEach(function (k) { if (k !== "message_hash") body[k] = m[k]; });
+        if (Hash.sha256Hex(Hash.canonical(body)) !== m.message_hash) {
+          errors.push("message_hash mismatch at seq " + m.sequence);
+        }
+        if (Hash.sha256Canonical(m.payload) !== m.payload_hash) {
+          errors.push("payload_hash mismatch at seq " + m.sequence);
+        }
+        if (i > 0 && m.consensus_timestamp < state.log[i - 1].consensus_timestamp) {
+          errors.push("timestamp regression at seq " + m.sequence);
+        }
+        prev = m.message_hash;
+      }
+      return { ok: errors.length === 0, messages: state.log.length, errors: errors };
+    }
+
+    // -- price series lookup (oracle rule, fail-closed) ------------------
+    function seriesHours() {
+      // Returns [{ts: Date, price, source}] covering synthetic + live
+      // snapshot. Synthetic covers 2026-10-27T00:00Z..2026-11-10T00:00Z;
+      // live snapshot covers 2026-11-12T11:00Z..2026-11-12T15:00Z.
+      var out = data.synthetic.prices.map(function (p) {
+        return { ts: new Date(p.timestamp), price: p.price, source: "SYNTHETIC" };
+      });
+      data.live_snapshot.hours.forEach(function (p) {
+        out.push({ ts: new Date(p.timestamp), price: p.price, source: "LIVE SNAPSHOT" });
+      });
+      return out;
+    }
+
+    function maxPriceOverWindow(windowStartIso, windowEndIso) {
+      var start = parseTime(windowStartIso);
+      var end = parseTime(windowEndIso);
+      var hours = seriesHours();
+      var covered = [];
+      var source = null;
+      var cursor = new Date(start);
+      cursor.setUTCMinutes(0, 0, 0);
+      while (cursor < end) {
+        var found = null;
+        for (var i = 0; i < hours.length; i++) {
+          if (hours[i].ts.getTime() === cursor.getTime()) { found = hours[i]; break; }
+        }
+        if (!found) {
+          throw EngineError(503, "AESO_NO_DATA: no pool price for hour starting " +
+            cursor.toISOString() + " (series does not cover the window)");
+        }
+        if (source === null) source = found.source;
+        if (found.source !== source) {
+          throw EngineError(503, "AESO_NO_DATA: window spans two price sources " +
+            "(" + source + " + " + found.source + ") — settlement refuses mixed sources");
+        }
+        covered.push(found.price);
+        cursor = new Date(cursor.getTime() + 3600000);
+      }
+      return { max: Math.max.apply(null, covered), source: source, hours: covered.length };
+    }
+
+    // -- markets ---------------------------------------------------------
+    function createMarket(fields) {
+      var market;
+      try {
+        market = newMarket(fields, now());
+      } catch (err) {
+        throw EngineError(400, "INVALID_MARKET: " + err.message);
+      }
+      market.market_id = "mkt_sandbox_" + String(++state.marketCounter).padStart(3, "0") +
+        "_" + Math.random().toString(16).slice(2, 8);
+      hcsAppend(market.created_by, "create_market", {
+        market_id: market.market_id,
+        question: market.question,
+        resolution_type: market.resolution_type,
+        contract_type: market.contract_type,
+        strike: market.strike,
+        window_start: market.window_start,
+        window_end: market.window_end,
+        resolves_at: market.resolves_at,
+        outcomes: market.outcomes,
+        b: market.b
+      }, { told_by: "sandbox-operator", known_facts: [] });
+      state.markets[market.market_id] = market;
+      return JSON.parse(JSON.stringify(market));
+    }
+
+    function listMarkets() {
+      return Object.keys(state.markets).sort().map(function (id) {
+        return JSON.parse(JSON.stringify(state.markets[id]));
+      });
+    }
+
+    function getMarket(marketId) {
+      var m = state.markets[marketId];
+      if (!m) throw EngineError(404, "MARKET_NOT_FOUND");
+      return JSON.parse(JSON.stringify(m));
+    }
+
+    // -- orders ----------------------------------------------------------
+    function placeOrder(agentId, payload) {
+      var marketId = payload.market_id;
+      var side = payload.side;
+      var shares = Number(payload.shares);
+      var action = payload.action || "buy";
+      if (!agentId) throw EngineError(400, "INVALID_ORDER: agent_id required");
+      if (!marketId || !side || !(shares > 0)) {
+        throw EngineError(400, "INVALID_ORDER: market_id, side, shares required");
+      }
+      if (action !== "buy" && action !== "sell") {
+        throw EngineError(400, "INVALID_ORDER: action must be buy or sell");
+      }
+      var market = state.markets[marketId];
+      if (!market) throw EngineError(404, "MARKET_NOT_FOUND");
+      if (market.outcomes.indexOf(side) === -1) {
+        throw EngineError(400, "INVALID_ORDER: side must be one of the market outcomes");
+      }
+      var tradable = canTrade(market, now());
+      if (!tradable[0]) throw EngineError(409, tradable[1]);
+      var signedShares = action === "buy" ? shares : -shares;
+      if (action === "sell" && position(agentId, marketId, side) < shares - 1e-9) {
+        throw EngineError(400, "INSUFFICIENT_SHARES");
+      }
+      var index = market.outcomes.indexOf(side);
+      var cost = LMSR.tradeCostMulti(market.q, market.b, index, signedShares);
+      var effectiveBalance = state.agents[agentId] ? balance(agentId) : STARTING_POINTS;
+      if (cost > 0 && cost > effectiveBalance + 1e-9) {
+        throw EngineError(403, "INSUFFICIENT_POINTS");
+      }
+      // HCS log BEFORE execution (a log failure executes nothing).
+      hcsAppend(agentId, "place_order", {
+        agent_id: agentId, market_id: marketId, side: side,
+        shares: shares, action: action
+      }, { told_by: "sandbox", known_facts: [] });
+      // Execute.
+      var newQ = LMSR.applyTradeMulti(market.q, index, signedShares);
+      var pricesAfter = LMSR.pricesMulti(newQ, market.b);
+      market.q = newQ;
+      market.prices = {};
+      market.outcomes.forEach(function (o, idx) { market.prices[o] = pricesAfter[idx]; });
+      if (market.outcomes.join("|") === BINARY_OUTCOMES.join("|")) {
+        market.q_yes = newQ[0]; market.q_no = newQ[1];
+        market.price_yes = pricesAfter[0];
+      }
+      ensureAgent(agentId);
+      state.agents[agentId].balance = r6(state.agents[agentId].balance - cost);
+      state.pool = r6(state.pool + cost);
+      var key = agentId + "|" + marketId + "|" + side;
+      var newShares = r6((state.positions[key] || 0) + signedShares);
+      if (Math.abs(newShares) < 1e-9) delete state.positions[key];
+      else state.positions[key] = newShares;
+      var receipt = {
+        trade_id: "trd_" + Math.random().toString(16).slice(2, 14),
+        timestamp: now().toISOString(),
+        market_id: marketId,
+        agent_id: agentId,
+        side: side,
+        action: action,
+        shares: shares,
+        cost_points: cost,
+        prices_after: market.prices,
+        balance_after: balance(agentId)
+      };
+      state.trades.push(receipt);
+      return JSON.parse(JSON.stringify(receipt));
+    }
+
+    // -- settlement --------------------------------------------------------
+    function settleMarket(marketId, opts) {
+      opts = opts || {};
+      var market = state.markets[marketId];
+      if (!market) throw EngineError(404, "MARKET_NOT_FOUND");
+      var settleable = canSettle(market, now());
+      if (!settleable[0]) throw EngineError(409, settleable[1]);
+      var observedValue = null, evidence = opts.evidence || null, source = null;
+      var outcome;
+      if (market.resolution_type === "aeso_price") {
+        // Oracle path: max hourly pool price over the window. The
+        // operator-supplied value is ignored; a window the series does
+        // not cover refuses settlement (503) and the market stays OPEN.
+        var res = maxPriceOverWindow(market.window_start, market.window_end);
+        observedValue = res.max;
+        source = res.source;
+        evidence = market.resolution_source_url;
+        outcome = resolveOutcome(market, observedValue, null);
+      } else {
+        if (!evidence) throw EngineError(400, "INVALID_SETTLEMENT: public_source settlement requires evidence");
+        outcome = resolveOutcome(market, null, opts.outcome);
+      }
+      hcsAppend("exchange", "settle_market", {
+        market_id: marketId, outcome: outcome,
+        observed_value: observedValue, evidence: evidence
+      }, { told_by: source === "SYNTHETIC" ? "synthetic-series" :
+                    source === "LIVE SNAPSHOT" ? "aeso-oracle" : "sandbox-operator",
+           known_facts: [] });
+      // Payouts: 1 point per winning share, 0 per losing share.
+      var payouts = [];
+      Object.keys(state.positions).sort().forEach(function (key) {
+        var parts = key.split("|");
+        if (parts[1] !== marketId) return;
+        var shares = state.positions[key];
+        delete state.positions[key];
+        var payout = parts[2] === outcome ? r6(shares) : 0;
+        if (payout) {
+          state.agents[parts[0]].balance = r6(state.agents[parts[0]].balance + payout);
+          state.pool = r6(state.pool - payout);
+        }
+        payouts.push({ agent_id: parts[0], market_id: marketId, side: parts[2],
+                       shares: shares, payout_points: payout });
+      });
+      market.status = "RESOLVED";
+      market.outcome = outcome;
+      market.observed_value = observedValue;
+      market.evidence = evidence;
+      market.settled_at = now().toISOString();
+      market.settlement_source = source;
+      return { market_id: marketId, question: market.question,
+               resolution_type: market.resolution_type, outcome: outcome,
+               observed_value: observedValue, evidence: evidence,
+               settlement_source: source, settled_at: market.settled_at,
+               payouts: payouts };
+    }
+
+    // -- scheduler audit (mirrors joulex/orchestrator.py run_simulation)
+    // Every orchestrator allocation decision is appended to the HCS log
+    // with its inputs, plus a summary message. Without this the run is
+    // not auditable and cannot be GO (same rule as Python).
+    function auditScheduler(prices, jobs, alloc, result) {
+      var seriesPairs = prices.map(function (p) { return [p[0], p[1]]; });
+      var seriesHash = Hash.sha256Hex(Hash.canonical(seriesPairs));
+      var sourceLabel = result.source_label || "SYNTHETIC";
+      var toldBy = sourceLabel === "REAL" ? "aeso-oracle" : "synthetic-series";
+      var logged = 0;
+      jobs.slice().sort(function (a, b) {
+        return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
+      }).forEach(function (job) {
+        var hours = (alloc[job.job_id] || []).slice().sort(function (a, b) { return a - b; });
+        if (!hours.length) return;
+        var jobCost = 0;
+        hours.forEach(function (h) { jobCost += prices[h][1] * job.power_mw; });
+        hcsAppend("joulex-orchestrator", "orchestrator_allocate", {
+          job_id: job.job_id,
+          hours: hours,
+          hour_starts: hours.map(function (h) { return prices[h][0]; }),
+          prices: hours.map(function (h) { return prices[h][1]; }),
+          power_mw: job.power_mw,
+          cost: r6(jobCost),
+          source_label: sourceLabel,
+          price_series_hash: seriesHash,
+          scheduler: "orchestrator"
+        }, { told_by: toldBy, known_facts: [seriesHash] });
+        logged += 1;
+      });
+      hcsAppend("joulex-orchestrator", "orchestrator_summary", {
+        n_jobs: jobs.length,
+        decisions: result.coordination_cost ? result.coordination_cost.decisions : logged,
+        energy_cost: result.costs ? result.costs.orchestrator_energy : null,
+        coordination_cost: result.coordination_cost ? result.coordination_cost.total : null,
+        net_cost: result.costs ? result.costs.orchestrator_net : null,
+        sla_pct: result.sla_pct ? result.sla_pct.orchestrator : null,
+        source_label: sourceLabel,
+        price_series_hash: seriesHash
+      }, { told_by: toldBy, known_facts: [seriesHash] });
+      return logged;
+    }
+
+    // -- views -------------------------------------------------------------
+    function conservation() {
+      var total = r6(Object.keys(state.agents).reduce(function (s, a) {
+        return s + state.agents[a].balance;
+      }, 0) + state.pool);
+      var expected = r6(STARTING_POINTS * Object.keys(state.agents).length);
+      return { ok: Math.abs(total - expected) < 1e-6, total: total,
+               expected: expected, pool: r6(state.pool),
+               agents: Object.keys(state.agents).length };
+    }
+
+    function ledgerView() {
+      var balances = {};
+      Object.keys(state.agents).forEach(function (a) { balances[a] = state.agents[a].balance; });
+      return { balances: balances, pool: r6(state.pool), conservation: conservation() };
+    }
+
+    function advanceClock(hours) {
+      state.clock = new Date(now().getTime() + hours * 3600000).toISOString();
+      return state.clock;
+    }
+
+    function serialize() { return JSON.stringify(state); }
+
+    function loadSnapshot(json) {
+      var parsed = JSON.parse(json);
+      Object.keys(parsed).forEach(function (k) { state[k] = parsed[k]; });
+    }
+
+    function getState() { return JSON.parse(JSON.stringify(state)); }
+
+    // -- seed --------------------------------------------------------------
+    function seed() {
+      // Seed markets keep their stable IDs from data.json.
+      data.seed_markets.forEach(function (sm) {
+        var market = newMarket({
+          question: sm.question,
+          resolution_type: sm.resolution_type,
+          contract_type: sm.contract_type,
+          strike: sm.strike,
+          window_start: sm.window_start,
+          window_end: sm.window_end,
+          source_url: sm.source_url,
+          source_description: sm.source_description,
+          resolves_at: sm.resolves_at,
+          outcomes: sm.outcomes,
+          b: sm.b,
+          created_by: "sandbox-seed"
+        }, new Date(data.sandbox_clock_start));
+        market.market_id = sm.market_id;
+        state.markets[market.market_id] = market;
+        state.marketCounter += 1;
+      });
+      hcsAppend("sandbox", "sandbox_start", {
+        clock: data.sandbox_clock_start,
+        markets: data.seed_markets.map(function (m) { return m.market_id; }),
+        note: "SANDBOX — paper only. Local HCS log; not a Hedera consensus log."
+      }, { told_by: "sandbox", known_facts: [] });
+      data.seed_trades.forEach(function (t) {
+        // Seed trades bypass the clock (markets are OPEN at seed time).
+        placeOrder(t.agent_id, { market_id: t.market_id, side: t.side,
+                                 shares: t.shares, action: "buy" });
+      });
+      // The sandbox visitor trades as "you".
+      ensureAgent("you");
+      return getState();
+    }
+
+    return {
+      STARTING_POINTS: STARTING_POINTS,
+      now: now,
+      seed: seed,
+      createMarket: createMarket,
+      listMarkets: listMarkets,
+      getMarket: getMarket,
+      placeOrder: placeOrder,
+      settleMarket: settleMarket,
+      advanceClock: advanceClock,
+      balance: balance,
+      position: position,
+      positionsFor: positionsFor,
+      ledgerView: ledgerView,
+      conservation: conservation,
+      hcsLog: function () { return JSON.parse(JSON.stringify(state.log)); },
+      verifyLog: verifyLog,
+      serialize: serialize,
+      loadSnapshot: loadSnapshot,
+      getState: getState,
+      seriesHours: seriesHours,
+      maxPriceOverWindow: maxPriceOverWindow,
+      auditScheduler: auditScheduler,
+      EngineError: EngineError
+    };
+  }
+
+  return { createEngine: createEngine, EngineError: EngineError,
+           STARTING_POINTS: STARTING_POINTS };
+});
+</script>
+<script>var JOULEX_DATA = {
+ "generated_at": "2026-11-12T14:52:04.388257+00:00",
+ "synthetic": {
+  "label": "SYNTHETIC",
+  "source": "SYNTHETIC \u2014 labelled synthetic series built from Phase 1 verified AESO statistics (2025 avg $43.68/MWh, 10.6% zero-price hours, $999.99/MWh cap). NOT observed AESO data.",
+  "seed": 20261110,
+  "start": "2026-10-27T00:00:00+00:00",
+  "n_hours": 336,
+  "stats": {
+   "mean": 43.68,
+   "zero_hours": 36,
+   "cap_hours": 1,
+   "max": 999.99,
+   "min": 0.0
+  },
+  "warning": "SYNTHETIC data \u2014 not observed AESO data, never presented as observed AESO data. Built from Phase 1 verified 2025 statistics; the single cap hour over-represents the 2025 annual cap rate (0.3% of this window vs 0.09% of 2025) as a deliberate stress tail.",
+  "prices": [
+   {
+    "timestamp": "2026-10-27T00:00:00+00:00",
+    "price": 20.82
+   },
+   {
+    "timestamp": "2026-10-27T01:00:00+00:00",
+    "price": 29.02
+   },
+   {
+    "timestamp": "2026-10-27T02:00:00+00:00",
+    "price": 32.18
+   },
+   {
+    "timestamp": "2026-10-27T03:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-27T04:00:00+00:00",
+    "price": 21.41
+   },
+   {
+    "timestamp": "2026-10-27T05:00:00+00:00",
+    "price": 17.36
+   },
+   {
+    "timestamp": "2026-10-27T06:00:00+00:00",
+    "price": 46.53
+   },
+   {
+    "timestamp": "2026-10-27T07:00:00+00:00",
+    "price": 68.65
+   },
+   {
+    "timestamp": "2026-10-27T08:00:00+00:00",
+    "price": 51.54
+   },
+   {
+    "timestamp": "2026-10-27T09:00:00+00:00",
+    "price": 75.06
+   },
+   {
+    "timestamp": "2026-10-27T10:00:00+00:00",
+    "price": 19.69
+   },
+   {
+    "timestamp": "2026-10-27T11:00:00+00:00",
+    "price": 20.81
+   },
+   {
+    "timestamp": "2026-10-27T12:00:00+00:00",
+    "price": 20.43
+   },
+   {
+    "timestamp": "2026-10-27T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-27T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-27T15:00:00+00:00",
+    "price": 12.82
+   },
+   {
+    "timestamp": "2026-10-27T16:00:00+00:00",
+    "price": 39.0
+   },
+   {
+    "timestamp": "2026-10-27T17:00:00+00:00",
+    "price": 32.19
+   },
+   {
+    "timestamp": "2026-10-27T18:00:00+00:00",
+    "price": 32.51
+   },
+   {
+    "timestamp": "2026-10-27T19:00:00+00:00",
+    "price": 55.3
+   },
+   {
+    "timestamp": "2026-10-27T20:00:00+00:00",
+    "price": 115.44
+   },
+   {
+    "timestamp": "2026-10-27T21:00:00+00:00",
+    "price": 999.99
+   },
+   {
+    "timestamp": "2026-10-27T22:00:00+00:00",
+    "price": 69.73
+   },
+   {
+    "timestamp": "2026-10-27T23:00:00+00:00",
+    "price": 85.24
+   },
+   {
+    "timestamp": "2026-10-28T00:00:00+00:00",
+    "price": 125.01
+   },
+   {
+    "timestamp": "2026-10-28T01:00:00+00:00",
+    "price": 44.28
+   },
+   {
+    "timestamp": "2026-10-28T02:00:00+00:00",
+    "price": 23.72
+   },
+   {
+    "timestamp": "2026-10-28T03:00:00+00:00",
+    "price": 19.54
+   },
+   {
+    "timestamp": "2026-10-28T04:00:00+00:00",
+    "price": 33.24
+   },
+   {
+    "timestamp": "2026-10-28T05:00:00+00:00",
+    "price": 68.33
+   },
+   {
+    "timestamp": "2026-10-28T06:00:00+00:00",
+    "price": 79.66
+   },
+   {
+    "timestamp": "2026-10-28T07:00:00+00:00",
+    "price": 33.04
+   },
+   {
+    "timestamp": "2026-10-28T08:00:00+00:00",
+    "price": 14.99
+   },
+   {
+    "timestamp": "2026-10-28T09:00:00+00:00",
+    "price": 54.97
+   },
+   {
+    "timestamp": "2026-10-28T10:00:00+00:00",
+    "price": 67.96
+   },
+   {
+    "timestamp": "2026-10-28T11:00:00+00:00",
+    "price": 36.27
+   },
+   {
+    "timestamp": "2026-10-28T12:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-28T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-28T14:00:00+00:00",
+    "price": 12.42
+   },
+   {
+    "timestamp": "2026-10-28T15:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-28T16:00:00+00:00",
+    "price": 51.62
+   },
+   {
+    "timestamp": "2026-10-28T17:00:00+00:00",
+    "price": 50.15
+   },
+   {
+    "timestamp": "2026-10-28T18:00:00+00:00",
+    "price": 74.39
+   },
+   {
+    "timestamp": "2026-10-28T19:00:00+00:00",
+    "price": 96.9
+   },
+   {
+    "timestamp": "2026-10-28T20:00:00+00:00",
+    "price": 93.73
+   },
+   {
+    "timestamp": "2026-10-28T21:00:00+00:00",
+    "price": 48.69
+   },
+   {
+    "timestamp": "2026-10-28T22:00:00+00:00",
+    "price": 63.85
+   },
+   {
+    "timestamp": "2026-10-28T23:00:00+00:00",
+    "price": 38.48
+   },
+   {
+    "timestamp": "2026-10-29T00:00:00+00:00",
+    "price": 40.97
+   },
+   {
+    "timestamp": "2026-10-29T01:00:00+00:00",
+    "price": 13.2
+   },
+   {
+    "timestamp": "2026-10-29T02:00:00+00:00",
+    "price": 25.38
+   },
+   {
+    "timestamp": "2026-10-29T03:00:00+00:00",
+    "price": 13.81
+   },
+   {
+    "timestamp": "2026-10-29T04:00:00+00:00",
+    "price": 30.01
+   },
+   {
+    "timestamp": "2026-10-29T05:00:00+00:00",
+    "price": 22.83
+   },
+   {
+    "timestamp": "2026-10-29T06:00:00+00:00",
+    "price": 37.97
+   },
+   {
+    "timestamp": "2026-10-29T07:00:00+00:00",
+    "price": 96.16
+   },
+   {
+    "timestamp": "2026-10-29T08:00:00+00:00",
+    "price": 37.51
+   },
+   {
+    "timestamp": "2026-10-29T09:00:00+00:00",
+    "price": 57.69
+   },
+   {
+    "timestamp": "2026-10-29T10:00:00+00:00",
+    "price": 33.35
+   },
+   {
+    "timestamp": "2026-10-29T11:00:00+00:00",
+    "price": 17.98
+   },
+   {
+    "timestamp": "2026-10-29T12:00:00+00:00",
+    "price": 19.57
+   },
+   {
+    "timestamp": "2026-10-29T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-29T14:00:00+00:00",
+    "price": 12.13
+   },
+   {
+    "timestamp": "2026-10-29T15:00:00+00:00",
+    "price": 13.21
+   },
+   {
+    "timestamp": "2026-10-29T16:00:00+00:00",
+    "price": 43.83
+   },
+   {
+    "timestamp": "2026-10-29T17:00:00+00:00",
+    "price": 85.79
+   },
+   {
+    "timestamp": "2026-10-29T18:00:00+00:00",
+    "price": 52.08
+   },
+   {
+    "timestamp": "2026-10-29T19:00:00+00:00",
+    "price": 61.58
+   },
+   {
+    "timestamp": "2026-10-29T20:00:00+00:00",
+    "price": 181.58
+   },
+   {
+    "timestamp": "2026-10-29T21:00:00+00:00",
+    "price": 79.68
+   },
+   {
+    "timestamp": "2026-10-29T22:00:00+00:00",
+    "price": 68.53
+   },
+   {
+    "timestamp": "2026-10-29T23:00:00+00:00",
+    "price": 34.07
+   },
+   {
+    "timestamp": "2026-10-30T00:00:00+00:00",
+    "price": 59.33
+   },
+   {
+    "timestamp": "2026-10-30T01:00:00+00:00",
+    "price": 31.16
+   },
+   {
+    "timestamp": "2026-10-30T02:00:00+00:00",
+    "price": 79.42
+   },
+   {
+    "timestamp": "2026-10-30T03:00:00+00:00",
+    "price": 24.73
+   },
+   {
+    "timestamp": "2026-10-30T04:00:00+00:00",
+    "price": 16.83
+   },
+   {
+    "timestamp": "2026-10-30T05:00:00+00:00",
+    "price": 28.06
+   },
+   {
+    "timestamp": "2026-10-30T06:00:00+00:00",
+    "price": 22.61
+   },
+   {
+    "timestamp": "2026-10-30T07:00:00+00:00",
+    "price": 35.13
+   },
+   {
+    "timestamp": "2026-10-30T08:00:00+00:00",
+    "price": 145.44
+   },
+   {
+    "timestamp": "2026-10-30T09:00:00+00:00",
+    "price": 58.5
+   },
+   {
+    "timestamp": "2026-10-30T10:00:00+00:00",
+    "price": 26.0
+   },
+   {
+    "timestamp": "2026-10-30T11:00:00+00:00",
+    "price": 21.8
+   },
+   {
+    "timestamp": "2026-10-30T12:00:00+00:00",
+    "price": 14.23
+   },
+   {
+    "timestamp": "2026-10-30T13:00:00+00:00",
+    "price": 14.97
+   },
+   {
+    "timestamp": "2026-10-30T14:00:00+00:00",
+    "price": 13.39
+   },
+   {
+    "timestamp": "2026-10-30T15:00:00+00:00",
+    "price": 12.16
+   },
+   {
+    "timestamp": "2026-10-30T16:00:00+00:00",
+    "price": 66.64
+   },
+   {
+    "timestamp": "2026-10-30T17:00:00+00:00",
+    "price": 53.21
+   },
+   {
+    "timestamp": "2026-10-30T18:00:00+00:00",
+    "price": 73.89
+   },
+   {
+    "timestamp": "2026-10-30T19:00:00+00:00",
+    "price": 29.28
+   },
+   {
+    "timestamp": "2026-10-30T20:00:00+00:00",
+    "price": 85.69
+   },
+   {
+    "timestamp": "2026-10-30T21:00:00+00:00",
+    "price": 113.16
+   },
+   {
+    "timestamp": "2026-10-30T22:00:00+00:00",
+    "price": 49.52
+   },
+   {
+    "timestamp": "2026-10-30T23:00:00+00:00",
+    "price": 43.59
+   },
+   {
+    "timestamp": "2026-10-31T00:00:00+00:00",
+    "price": 11.63
+   },
+   {
+    "timestamp": "2026-10-31T01:00:00+00:00",
+    "price": 13.01
+   },
+   {
+    "timestamp": "2026-10-31T02:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-31T03:00:00+00:00",
+    "price": 29.37
+   },
+   {
+    "timestamp": "2026-10-31T04:00:00+00:00",
+    "price": 33.01
+   },
+   {
+    "timestamp": "2026-10-31T05:00:00+00:00",
+    "price": 12.04
+   },
+   {
+    "timestamp": "2026-10-31T06:00:00+00:00",
+    "price": 84.32
+   },
+   {
+    "timestamp": "2026-10-31T07:00:00+00:00",
+    "price": 35.37
+   },
+   {
+    "timestamp": "2026-10-31T08:00:00+00:00",
+    "price": 107.12
+   },
+   {
+    "timestamp": "2026-10-31T09:00:00+00:00",
+    "price": 30.16
+   },
+   {
+    "timestamp": "2026-10-31T10:00:00+00:00",
+    "price": 22.28
+   },
+   {
+    "timestamp": "2026-10-31T11:00:00+00:00",
+    "price": 16.45
+   },
+   {
+    "timestamp": "2026-10-31T12:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-31T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-31T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-10-31T15:00:00+00:00",
+    "price": 33.51
+   },
+   {
+    "timestamp": "2026-10-31T16:00:00+00:00",
+    "price": 43.12
+   },
+   {
+    "timestamp": "2026-10-31T17:00:00+00:00",
+    "price": 83.94
+   },
+   {
+    "timestamp": "2026-10-31T18:00:00+00:00",
+    "price": 63.04
+   },
+   {
+    "timestamp": "2026-10-31T19:00:00+00:00",
+    "price": 140.47
+   },
+   {
+    "timestamp": "2026-10-31T20:00:00+00:00",
+    "price": 122.22
+   },
+   {
+    "timestamp": "2026-10-31T21:00:00+00:00",
+    "price": 93.99
+   },
+   {
+    "timestamp": "2026-10-31T22:00:00+00:00",
+    "price": 41.27
+   },
+   {
+    "timestamp": "2026-10-31T23:00:00+00:00",
+    "price": 18.16
+   },
+   {
+    "timestamp": "2026-11-01T00:00:00+00:00",
+    "price": 48.96
+   },
+   {
+    "timestamp": "2026-11-01T01:00:00+00:00",
+    "price": 15.87
+   },
+   {
+    "timestamp": "2026-11-01T02:00:00+00:00",
+    "price": 21.75
+   },
+   {
+    "timestamp": "2026-11-01T03:00:00+00:00",
+    "price": 13.89
+   },
+   {
+    "timestamp": "2026-11-01T04:00:00+00:00",
+    "price": 15.54
+   },
+   {
+    "timestamp": "2026-11-01T05:00:00+00:00",
+    "price": 27.62
+   },
+   {
+    "timestamp": "2026-11-01T06:00:00+00:00",
+    "price": 52.57
+   },
+   {
+    "timestamp": "2026-11-01T07:00:00+00:00",
+    "price": 19.74
+   },
+   {
+    "timestamp": "2026-11-01T08:00:00+00:00",
+    "price": 49.46
+   },
+   {
+    "timestamp": "2026-11-01T09:00:00+00:00",
+    "price": 52.95
+   },
+   {
+    "timestamp": "2026-11-01T10:00:00+00:00",
+    "price": 26.53
+   },
+   {
+    "timestamp": "2026-11-01T11:00:00+00:00",
+    "price": 59.57
+   },
+   {
+    "timestamp": "2026-11-01T12:00:00+00:00",
+    "price": 11.37
+   },
+   {
+    "timestamp": "2026-11-01T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-01T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-01T15:00:00+00:00",
+    "price": 13.49
+   },
+   {
+    "timestamp": "2026-11-01T16:00:00+00:00",
+    "price": 34.81
+   },
+   {
+    "timestamp": "2026-11-01T17:00:00+00:00",
+    "price": 79.43
+   },
+   {
+    "timestamp": "2026-11-01T18:00:00+00:00",
+    "price": 31.24
+   },
+   {
+    "timestamp": "2026-11-01T19:00:00+00:00",
+    "price": 68.22
+   },
+   {
+    "timestamp": "2026-11-01T20:00:00+00:00",
+    "price": 78.06
+   },
+   {
+    "timestamp": "2026-11-01T21:00:00+00:00",
+    "price": 43.64
+   },
+   {
+    "timestamp": "2026-11-01T22:00:00+00:00",
+    "price": 17.68
+   },
+   {
+    "timestamp": "2026-11-01T23:00:00+00:00",
+    "price": 35.3
+   },
+   {
+    "timestamp": "2026-11-02T00:00:00+00:00",
+    "price": 18.83
+   },
+   {
+    "timestamp": "2026-11-02T01:00:00+00:00",
+    "price": 22.17
+   },
+   {
+    "timestamp": "2026-11-02T02:00:00+00:00",
+    "price": 51.79
+   },
+   {
+    "timestamp": "2026-11-02T03:00:00+00:00",
+    "price": 21.12
+   },
+   {
+    "timestamp": "2026-11-02T04:00:00+00:00",
+    "price": 22.59
+   },
+   {
+    "timestamp": "2026-11-02T05:00:00+00:00",
+    "price": 11.34
+   },
+   {
+    "timestamp": "2026-11-02T06:00:00+00:00",
+    "price": 39.17
+   },
+   {
+    "timestamp": "2026-11-02T07:00:00+00:00",
+    "price": 25.99
+   },
+   {
+    "timestamp": "2026-11-02T08:00:00+00:00",
+    "price": 42.94
+   },
+   {
+    "timestamp": "2026-11-02T09:00:00+00:00",
+    "price": 15.91
+   },
+   {
+    "timestamp": "2026-11-02T10:00:00+00:00",
+    "price": 36.08
+   },
+   {
+    "timestamp": "2026-11-02T11:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-02T12:00:00+00:00",
+    "price": 13.99
+   },
+   {
+    "timestamp": "2026-11-02T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-02T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-02T15:00:00+00:00",
+    "price": 14.31
+   },
+   {
+    "timestamp": "2026-11-02T16:00:00+00:00",
+    "price": 40.65
+   },
+   {
+    "timestamp": "2026-11-02T17:00:00+00:00",
+    "price": 79.14
+   },
+   {
+    "timestamp": "2026-11-02T18:00:00+00:00",
+    "price": 45.48
+   },
+   {
+    "timestamp": "2026-11-02T19:00:00+00:00",
+    "price": 66.86
+   },
+   {
+    "timestamp": "2026-11-02T20:00:00+00:00",
+    "price": 168.23
+   },
+   {
+    "timestamp": "2026-11-02T21:00:00+00:00",
+    "price": 166.46
+   },
+   {
+    "timestamp": "2026-11-02T22:00:00+00:00",
+    "price": 25.66
+   },
+   {
+    "timestamp": "2026-11-02T23:00:00+00:00",
+    "price": 49.18
+   },
+   {
+    "timestamp": "2026-11-03T00:00:00+00:00",
+    "price": 23.29
+   },
+   {
+    "timestamp": "2026-11-03T01:00:00+00:00",
+    "price": 15.18
+   },
+   {
+    "timestamp": "2026-11-03T02:00:00+00:00",
+    "price": 29.35
+   },
+   {
+    "timestamp": "2026-11-03T03:00:00+00:00",
+    "price": 17.96
+   },
+   {
+    "timestamp": "2026-11-03T04:00:00+00:00",
+    "price": 17.37
+   },
+   {
+    "timestamp": "2026-11-03T05:00:00+00:00",
+    "price": 23.54
+   },
+   {
+    "timestamp": "2026-11-03T06:00:00+00:00",
+    "price": 64.05
+   },
+   {
+    "timestamp": "2026-11-03T07:00:00+00:00",
+    "price": 37.93
+   },
+   {
+    "timestamp": "2026-11-03T08:00:00+00:00",
+    "price": 98.3
+   },
+   {
+    "timestamp": "2026-11-03T09:00:00+00:00",
+    "price": 14.58
+   },
+   {
+    "timestamp": "2026-11-03T10:00:00+00:00",
+    "price": 88.81
+   },
+   {
+    "timestamp": "2026-11-03T11:00:00+00:00",
+    "price": 56.45
+   },
+   {
+    "timestamp": "2026-11-03T12:00:00+00:00",
+    "price": 12.42
+   },
+   {
+    "timestamp": "2026-11-03T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-03T14:00:00+00:00",
+    "price": 16.85
+   },
+   {
+    "timestamp": "2026-11-03T15:00:00+00:00",
+    "price": 32.05
+   },
+   {
+    "timestamp": "2026-11-03T16:00:00+00:00",
+    "price": 48.12
+   },
+   {
+    "timestamp": "2026-11-03T17:00:00+00:00",
+    "price": 20.61
+   },
+   {
+    "timestamp": "2026-11-03T18:00:00+00:00",
+    "price": 47.75
+   },
+   {
+    "timestamp": "2026-11-03T19:00:00+00:00",
+    "price": 201.86
+   },
+   {
+    "timestamp": "2026-11-03T20:00:00+00:00",
+    "price": 88.64
+   },
+   {
+    "timestamp": "2026-11-03T21:00:00+00:00",
+    "price": 102.72
+   },
+   {
+    "timestamp": "2026-11-03T22:00:00+00:00",
+    "price": 82.52
+   },
+   {
+    "timestamp": "2026-11-03T23:00:00+00:00",
+    "price": 20.99
+   },
+   {
+    "timestamp": "2026-11-04T00:00:00+00:00",
+    "price": 38.73
+   },
+   {
+    "timestamp": "2026-11-04T01:00:00+00:00",
+    "price": 29.09
+   },
+   {
+    "timestamp": "2026-11-04T02:00:00+00:00",
+    "price": 15.41
+   },
+   {
+    "timestamp": "2026-11-04T03:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-04T04:00:00+00:00",
+    "price": 55.88
+   },
+   {
+    "timestamp": "2026-11-04T05:00:00+00:00",
+    "price": 34.77
+   },
+   {
+    "timestamp": "2026-11-04T06:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-04T07:00:00+00:00",
+    "price": 32.18
+   },
+   {
+    "timestamp": "2026-11-04T08:00:00+00:00",
+    "price": 35.18
+   },
+   {
+    "timestamp": "2026-11-04T09:00:00+00:00",
+    "price": 89.62
+   },
+   {
+    "timestamp": "2026-11-04T10:00:00+00:00",
+    "price": 52.48
+   },
+   {
+    "timestamp": "2026-11-04T11:00:00+00:00",
+    "price": 21.96
+   },
+   {
+    "timestamp": "2026-11-04T12:00:00+00:00",
+    "price": 12.91
+   },
+   {
+    "timestamp": "2026-11-04T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-04T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-04T15:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-04T16:00:00+00:00",
+    "price": 16.71
+   },
+   {
+    "timestamp": "2026-11-04T17:00:00+00:00",
+    "price": 32.85
+   },
+   {
+    "timestamp": "2026-11-04T18:00:00+00:00",
+    "price": 43.07
+   },
+   {
+    "timestamp": "2026-11-04T19:00:00+00:00",
+    "price": 83.31
+   },
+   {
+    "timestamp": "2026-11-04T20:00:00+00:00",
+    "price": 31.8
+   },
+   {
+    "timestamp": "2026-11-04T21:00:00+00:00",
+    "price": 62.18
+   },
+   {
+    "timestamp": "2026-11-04T22:00:00+00:00",
+    "price": 39.95
+   },
+   {
+    "timestamp": "2026-11-04T23:00:00+00:00",
+    "price": 31.23
+   },
+   {
+    "timestamp": "2026-11-05T00:00:00+00:00",
+    "price": 19.12
+   },
+   {
+    "timestamp": "2026-11-05T01:00:00+00:00",
+    "price": 27.82
+   },
+   {
+    "timestamp": "2026-11-05T02:00:00+00:00",
+    "price": 23.61
+   },
+   {
+    "timestamp": "2026-11-05T03:00:00+00:00",
+    "price": 19.0
+   },
+   {
+    "timestamp": "2026-11-05T04:00:00+00:00",
+    "price": 46.6
+   },
+   {
+    "timestamp": "2026-11-05T05:00:00+00:00",
+    "price": 28.9
+   },
+   {
+    "timestamp": "2026-11-05T06:00:00+00:00",
+    "price": 22.32
+   },
+   {
+    "timestamp": "2026-11-05T07:00:00+00:00",
+    "price": 40.83
+   },
+   {
+    "timestamp": "2026-11-05T08:00:00+00:00",
+    "price": 37.73
+   },
+   {
+    "timestamp": "2026-11-05T09:00:00+00:00",
+    "price": 42.18
+   },
+   {
+    "timestamp": "2026-11-05T10:00:00+00:00",
+    "price": 43.41
+   },
+   {
+    "timestamp": "2026-11-05T11:00:00+00:00",
+    "price": 17.04
+   },
+   {
+    "timestamp": "2026-11-05T12:00:00+00:00",
+    "price": 18.74
+   },
+   {
+    "timestamp": "2026-11-05T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-05T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-05T15:00:00+00:00",
+    "price": 35.0
+   },
+   {
+    "timestamp": "2026-11-05T16:00:00+00:00",
+    "price": 44.94
+   },
+   {
+    "timestamp": "2026-11-05T17:00:00+00:00",
+    "price": 46.97
+   },
+   {
+    "timestamp": "2026-11-05T18:00:00+00:00",
+    "price": 31.57
+   },
+   {
+    "timestamp": "2026-11-05T19:00:00+00:00",
+    "price": 25.27
+   },
+   {
+    "timestamp": "2026-11-05T20:00:00+00:00",
+    "price": 45.85
+   },
+   {
+    "timestamp": "2026-11-05T21:00:00+00:00",
+    "price": 118.71
+   },
+   {
+    "timestamp": "2026-11-05T22:00:00+00:00",
+    "price": 21.2
+   },
+   {
+    "timestamp": "2026-11-05T23:00:00+00:00",
+    "price": 26.79
+   },
+   {
+    "timestamp": "2026-11-06T00:00:00+00:00",
+    "price": 35.5
+   },
+   {
+    "timestamp": "2026-11-06T01:00:00+00:00",
+    "price": 17.68
+   },
+   {
+    "timestamp": "2026-11-06T02:00:00+00:00",
+    "price": 35.43
+   },
+   {
+    "timestamp": "2026-11-06T03:00:00+00:00",
+    "price": 60.08
+   },
+   {
+    "timestamp": "2026-11-06T04:00:00+00:00",
+    "price": 16.83
+   },
+   {
+    "timestamp": "2026-11-06T05:00:00+00:00",
+    "price": 48.9
+   },
+   {
+    "timestamp": "2026-11-06T06:00:00+00:00",
+    "price": 33.76
+   },
+   {
+    "timestamp": "2026-11-06T07:00:00+00:00",
+    "price": 109.27
+   },
+   {
+    "timestamp": "2026-11-06T08:00:00+00:00",
+    "price": 40.21
+   },
+   {
+    "timestamp": "2026-11-06T09:00:00+00:00",
+    "price": 27.67
+   },
+   {
+    "timestamp": "2026-11-06T10:00:00+00:00",
+    "price": 58.52
+   },
+   {
+    "timestamp": "2026-11-06T11:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-06T12:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-06T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-06T14:00:00+00:00",
+    "price": 28.99
+   },
+   {
+    "timestamp": "2026-11-06T15:00:00+00:00",
+    "price": 22.88
+   },
+   {
+    "timestamp": "2026-11-06T16:00:00+00:00",
+    "price": 68.51
+   },
+   {
+    "timestamp": "2026-11-06T17:00:00+00:00",
+    "price": 46.49
+   },
+   {
+    "timestamp": "2026-11-06T18:00:00+00:00",
+    "price": 100.73
+   },
+   {
+    "timestamp": "2026-11-06T19:00:00+00:00",
+    "price": 100.56
+   },
+   {
+    "timestamp": "2026-11-06T20:00:00+00:00",
+    "price": 91.66
+   },
+   {
+    "timestamp": "2026-11-06T21:00:00+00:00",
+    "price": 100.73
+   },
+   {
+    "timestamp": "2026-11-06T22:00:00+00:00",
+    "price": 88.56
+   },
+   {
+    "timestamp": "2026-11-06T23:00:00+00:00",
+    "price": 26.78
+   },
+   {
+    "timestamp": "2026-11-07T00:00:00+00:00",
+    "price": 18.55
+   },
+   {
+    "timestamp": "2026-11-07T01:00:00+00:00",
+    "price": 18.41
+   },
+   {
+    "timestamp": "2026-11-07T02:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-07T03:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-07T04:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-07T05:00:00+00:00",
+    "price": 84.49
+   },
+   {
+    "timestamp": "2026-11-07T06:00:00+00:00",
+    "price": 26.54
+   },
+   {
+    "timestamp": "2026-11-07T07:00:00+00:00",
+    "price": 76.65
+   },
+   {
+    "timestamp": "2026-11-07T08:00:00+00:00",
+    "price": 65.79
+   },
+   {
+    "timestamp": "2026-11-07T09:00:00+00:00",
+    "price": 33.81
+   },
+   {
+    "timestamp": "2026-11-07T10:00:00+00:00",
+    "price": 28.45
+   },
+   {
+    "timestamp": "2026-11-07T11:00:00+00:00",
+    "price": 42.13
+   },
+   {
+    "timestamp": "2026-11-07T12:00:00+00:00",
+    "price": 13.83
+   },
+   {
+    "timestamp": "2026-11-07T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-07T14:00:00+00:00",
+    "price": 22.95
+   },
+   {
+    "timestamp": "2026-11-07T15:00:00+00:00",
+    "price": 11.56
+   },
+   {
+    "timestamp": "2026-11-07T16:00:00+00:00",
+    "price": 22.91
+   },
+   {
+    "timestamp": "2026-11-07T17:00:00+00:00",
+    "price": 46.85
+   },
+   {
+    "timestamp": "2026-11-07T18:00:00+00:00",
+    "price": 58.76
+   },
+   {
+    "timestamp": "2026-11-07T19:00:00+00:00",
+    "price": 32.09
+   },
+   {
+    "timestamp": "2026-11-07T20:00:00+00:00",
+    "price": 103.18
+   },
+   {
+    "timestamp": "2026-11-07T21:00:00+00:00",
+    "price": 79.98
+   },
+   {
+    "timestamp": "2026-11-07T22:00:00+00:00",
+    "price": 36.17
+   },
+   {
+    "timestamp": "2026-11-07T23:00:00+00:00",
+    "price": 27.63
+   },
+   {
+    "timestamp": "2026-11-08T00:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-08T01:00:00+00:00",
+    "price": 35.5
+   },
+   {
+    "timestamp": "2026-11-08T02:00:00+00:00",
+    "price": 13.22
+   },
+   {
+    "timestamp": "2026-11-08T03:00:00+00:00",
+    "price": 15.76
+   },
+   {
+    "timestamp": "2026-11-08T04:00:00+00:00",
+    "price": 16.66
+   },
+   {
+    "timestamp": "2026-11-08T05:00:00+00:00",
+    "price": 51.28
+   },
+   {
+    "timestamp": "2026-11-08T06:00:00+00:00",
+    "price": 45.19
+   },
+   {
+    "timestamp": "2026-11-08T07:00:00+00:00",
+    "price": 34.28
+   },
+   {
+    "timestamp": "2026-11-08T08:00:00+00:00",
+    "price": 20.46
+   },
+   {
+    "timestamp": "2026-11-08T09:00:00+00:00",
+    "price": 31.58
+   },
+   {
+    "timestamp": "2026-11-08T10:00:00+00:00",
+    "price": 36.62
+   },
+   {
+    "timestamp": "2026-11-08T11:00:00+00:00",
+    "price": 15.67
+   },
+   {
+    "timestamp": "2026-11-08T12:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-08T13:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-08T14:00:00+00:00",
+    "price": 11.92
+   },
+   {
+    "timestamp": "2026-11-08T15:00:00+00:00",
+    "price": 25.99
+   },
+   {
+    "timestamp": "2026-11-08T16:00:00+00:00",
+    "price": 61.06
+   },
+   {
+    "timestamp": "2026-11-08T17:00:00+00:00",
+    "price": 29.5
+   },
+   {
+    "timestamp": "2026-11-08T18:00:00+00:00",
+    "price": 126.75
+   },
+   {
+    "timestamp": "2026-11-08T19:00:00+00:00",
+    "price": 181.47
+   },
+   {
+    "timestamp": "2026-11-08T20:00:00+00:00",
+    "price": 25.52
+   },
+   {
+    "timestamp": "2026-11-08T21:00:00+00:00",
+    "price": 57.96
+   },
+   {
+    "timestamp": "2026-11-08T22:00:00+00:00",
+    "price": 36.33
+   },
+   {
+    "timestamp": "2026-11-08T23:00:00+00:00",
+    "price": 36.94
+   },
+   {
+    "timestamp": "2026-11-09T00:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-09T01:00:00+00:00",
+    "price": 10.91
+   },
+   {
+    "timestamp": "2026-11-09T02:00:00+00:00",
+    "price": 16.71
+   },
+   {
+    "timestamp": "2026-11-09T03:00:00+00:00",
+    "price": 21.9
+   },
+   {
+    "timestamp": "2026-11-09T04:00:00+00:00",
+    "price": 30.12
+   },
+   {
+    "timestamp": "2026-11-09T05:00:00+00:00",
+    "price": 17.44
+   },
+   {
+    "timestamp": "2026-11-09T06:00:00+00:00",
+    "price": 18.42
+   },
+   {
+    "timestamp": "2026-11-09T07:00:00+00:00",
+    "price": 94.73
+   },
+   {
+    "timestamp": "2026-11-09T08:00:00+00:00",
+    "price": 108.83
+   },
+   {
+    "timestamp": "2026-11-09T09:00:00+00:00",
+    "price": 145.68
+   },
+   {
+    "timestamp": "2026-11-09T10:00:00+00:00",
+    "price": 28.94
+   },
+   {
+    "timestamp": "2026-11-09T11:00:00+00:00",
+    "price": 17.98
+   },
+   {
+    "timestamp": "2026-11-09T12:00:00+00:00",
+    "price": 14.75
+   },
+   {
+    "timestamp": "2026-11-09T13:00:00+00:00",
+    "price": 12.56
+   },
+   {
+    "timestamp": "2026-11-09T14:00:00+00:00",
+    "price": 0.0
+   },
+   {
+    "timestamp": "2026-11-09T15:00:00+00:00",
+    "price": 15.68
+   },
+   {
+    "timestamp": "2026-11-09T16:00:00+00:00",
+    "price": 18.88
+   },
+   {
+    "timestamp": "2026-11-09T17:00:00+00:00",
+    "price": 59.13
+   },
+   {
+    "timestamp": "2026-11-09T18:00:00+00:00",
+    "price": 42.8
+   },
+   {
+    "timestamp": "2026-11-09T19:00:00+00:00",
+    "price": 57.2
+   },
+   {
+    "timestamp": "2026-11-09T20:00:00+00:00",
+    "price": 112.49
+   },
+   {
+    "timestamp": "2026-11-09T21:00:00+00:00",
+    "price": 111.55
+   },
+   {
+    "timestamp": "2026-11-09T22:00:00+00:00",
+    "price": 55.81
+   },
+   {
+    "timestamp": "2026-11-09T23:00:00+00:00",
+    "price": 14.92
+   }
+  ]
+ },
+ "live_snapshot": {
+  "label": "LIVE SNAPSHOT",
+  "source_url": "http://ets.aeso.ca/ets_web/ip/Market/Reports/CSMPriceReportServlet?contentType=csv",
+  "fetched_at": "2026-11-12T14:47:21Z",
+  "fetched_by": "joulex.aeso.parse_smp_csv + _hourly_pool_prices (same code as the oracle)",
+  "coverage_note": "The live SMP report covers only the recent ~3 hours. The historical PoolPriceReportServlet returns HTTP 403 from this VM, so no multi-day live history exists. A browser cannot fetch this endpoint directly (no CORS headers, plain HTTP) \u2014 hence the embedded snapshot.",
+  "hours": [
+   {
+    "timestamp": "2026-11-12T11:00:00+00:00",
+    "price": 3.59
+   },
+   {
+    "timestamp": "2026-11-12T12:00:00+00:00",
+    "price": 12.6
+   },
+   {
+    "timestamp": "2026-11-12T13:00:00+00:00",
+    "price": 16.52
+   },
+   {
+    "timestamp": "2026-11-12T14:00:00+00:00",
+    "price": 21.18
+   }
+  ]
+ },
+ "jobs": [
+  {
+   "job_id": "job-01",
+   "hours": 9,
+   "power_mw": 0.33,
+   "earliest_start": 89,
+   "deadline": 137
+  },
+  {
+   "job_id": "job-02",
+   "hours": 4,
+   "power_mw": 0.29,
+   "earliest_start": 163,
+   "deadline": 211
+  },
+  {
+   "job_id": "job-03",
+   "hours": 10,
+   "power_mw": 0.29,
+   "earliest_start": 167,
+   "deadline": 203
+  },
+  {
+   "job_id": "job-04",
+   "hours": 9,
+   "power_mw": 0.33,
+   "earliest_start": 180,
+   "deadline": 216
+  },
+  {
+   "job_id": "job-05",
+   "hours": 9,
+   "power_mw": 0.29,
+   "earliest_start": 89,
+   "deadline": 125
+  },
+  {
+   "job_id": "job-06",
+   "hours": 5,
+   "power_mw": 0.22,
+   "earliest_start": 83,
+   "deadline": 119
+  },
+  {
+   "job_id": "job-07",
+   "hours": 6,
+   "power_mw": 0.38,
+   "earliest_start": 37,
+   "deadline": 61
+  },
+  {
+   "job_id": "job-08",
+   "hours": 4,
+   "power_mw": 0.33,
+   "earliest_start": 41,
+   "deadline": 65
+  },
+  {
+   "job_id": "job-09",
+   "hours": 9,
+   "power_mw": 0.4,
+   "earliest_start": 123,
+   "deadline": 195
+  },
+  {
+   "job_id": "job-10",
+   "hours": 5,
+   "power_mw": 0.29,
+   "earliest_start": 45,
+   "deadline": 81
+  },
+  {
+   "job_id": "job-11",
+   "hours": 3,
+   "power_mw": 0.3,
+   "earliest_start": 222,
+   "deadline": 294
+  },
+  {
+   "job_id": "job-12",
+   "hours": 3,
+   "power_mw": 0.22,
+   "earliest_start": 15,
+   "deadline": 51
+  },
+  {
+   "job_id": "job-13",
+   "hours": 9,
+   "power_mw": 0.23,
+   "earliest_start": 111,
+   "deadline": 147
+  },
+  {
+   "job_id": "job-14",
+   "hours": 2,
+   "power_mw": 0.3,
+   "earliest_start": 110,
+   "deadline": 134
+  },
+  {
+   "job_id": "job-15",
+   "hours": 7,
+   "power_mw": 0.16,
+   "earliest_start": 10,
+   "deadline": 58
+  },
+  {
+   "job_id": "job-16",
+   "hours": 5,
+   "power_mw": 0.34,
+   "earliest_start": 100,
+   "deadline": 172
+  },
+  {
+   "job_id": "job-17",
+   "hours": 4,
+   "power_mw": 0.35,
+   "earliest_start": 197,
+   "deadline": 269
+  },
+  {
+   "job_id": "job-18",
+   "hours": 9,
+   "power_mw": 0.15,
+   "earliest_start": 98,
+   "deadline": 170
+  },
+  {
+   "job_id": "job-19",
+   "hours": 6,
+   "power_mw": 0.23,
+   "earliest_start": 1,
+   "deadline": 49
+  },
+  {
+   "job_id": "job-20",
+   "hours": 7,
+   "power_mw": 0.16,
+   "earliest_start": 270,
+   "deadline": 306
+  },
+  {
+   "job_id": "job-21",
+   "hours": 2,
+   "power_mw": 0.39,
+   "earliest_start": 236,
+   "deadline": 260
+  },
+  {
+   "job_id": "job-22",
+   "hours": 3,
+   "power_mw": 0.37,
+   "earliest_start": 211,
+   "deadline": 235
+  },
+  {
+   "job_id": "job-23",
+   "hours": 10,
+   "power_mw": 0.3,
+   "earliest_start": 120,
+   "deadline": 144
+  },
+  {
+   "job_id": "job-24",
+   "hours": 9,
+   "power_mw": 0.29,
+   "earliest_start": 17,
+   "deadline": 89
+  }
+ ],
+ "seed_markets": [
+  {
+   "market_id": "mkt_sandbox_flex1",
+   "question": "Will the Alberta pool price exceed $50/MWh during the delivery window Nov 2, 18:00\u201324:00 MT?",
+   "resolution_type": "aeso_price",
+   "contract_type": "flex_capacity",
+   "strike": 50.0,
+   "window_start": "2026-11-03T00:00:00+00:00",
+   "window_end": "2026-11-03T06:00:00+00:00",
+   "resolution_source_url": "http://ets.aeso.ca/ets_web/ip/Market/Reports/CSMPriceReportServlet?contentType=csv",
+   "resolves_at": "2026-11-04T00:00:00+00:00",
+   "b": 100.0,
+   "outcomes": [
+    "YES",
+    "NO"
+   ]
+  },
+  {
+   "market_id": "mkt_sandbox_compute1",
+   "question": "Will H100 spot be above $4.00/GPU-hr on Nov 8, 2026?",
+   "resolution_type": "public_source",
+   "contract_type": "compute_forward",
+   "source_url": "https://example.com/gpu-prices",
+   "source_description": "Published H100 spot price; YES iff above $4.00/GPU-hr. PLACEHOLDER SOURCE \u2014 sandbox only.",
+   "resolves_at": "2026-11-08T00:00:00+00:00",
+   "b": 100.0,
+   "outcomes": [
+    "YES",
+    "NO"
+   ]
+  },
+  {
+   "market_id": "mkt_sandbox_peak1",
+   "question": "In which band will the max Alberta pool price fall during Nov 4, 2026 (MT)?",
+   "resolution_type": "public_source",
+   "contract_type": "flex_capacity",
+   "source_url": "SYNTHETIC series (joulex.aeso_synthetic, seed 20261110)",
+   "source_description": "Max hourly pool price over Nov 4, 2026 from the labelled SYNTHETIC series; the sandbox derives the band and shows the derivation.",
+   "resolves_at": "2026-11-06T00:00:00+00:00",
+   "b": 100.0,
+   "outcomes": [
+    "$0\u201325",
+    "$25\u201350",
+    "$50\u2013100",
+    "$100+"
+   ]
+  }
+ ],
+ "seed_trades": [
+  {
+   "agent_id": "alice",
+   "market_id": "mkt_sandbox_flex1",
+   "side": "YES",
+   "shares": 10
+  },
+  {
+   "agent_id": "bob",
+   "market_id": "mkt_sandbox_flex1",
+   "side": "NO",
+   "shares": 20
+  },
+  {
+   "agent_id": "alice",
+   "market_id": "mkt_sandbox_compute1",
+   "side": "YES",
+   "shares": 10
+  },
+  {
+   "agent_id": "bob",
+   "market_id": "mkt_sandbox_compute1",
+   "side": "NO",
+   "shares": 10
+  }
+ ],
+ "sandbox_clock_start": "2026-10-27T00:00:00+00:00",
+ "verification": {
+  "flex_window_max_usd_per_mwh": 29.35,
+  "flex_outcome_vs_strike_50": "NO",
+  "peak_window_max_usd_per_mwh": 89.62
+ }
+};</script>
+<script>/* JouleX Sandbox — browser UI layer.
+ *
+ * Thin DOM binding over JoulexEngine (the tested engine). No pricing
+ * math here: quotes use JoulexLMSR directly on the market's own q/b,
+ * trades and settlements go through the engine. State persists per
+ * visitor in localStorage; nothing leaves the browser.
+ */
+(function () {
+  "use strict";
+
+  var LS_KEY = "joulex-sandbox-v1";
+  var eng = null;
+  var activeAgent = "you";
+  var autoTimer = null;
+  var chartMarketId = "mkt_sandbox_flex1";
+  var lastNotice = "";
+
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function fmt(n, dp) { return Number(n).toFixed(dp === undefined ? 2 : dp); }
+  function fmtMT(iso) {
+    try {
+      return new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Edmonton", year: "numeric", month: "short",
+        day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false
+      }).format(new Date(iso)) + " MT";
+    } catch (e) { return iso; }
+  }
+  function fmtUTC(iso) {
+    var d = new Date(iso);
+    return d.toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  }
+
+  function notice(msg, isError) {
+    lastNotice = msg;
+    var n = $("notice");
+    n.textContent = msg;
+    n.className = isError ? "notice err" : "notice ok";
+    n.style.display = "block";
+  }
+
+  function save() {
+    try { localStorage.setItem(LS_KEY, eng.serialize()); } catch (e) { /* private mode */ }
+  }
+
+  function init() {
+    eng = JoulexEngine.createEngine(JOULEX_DATA);
+    var restored = false;
+    try {
+      var snap = localStorage.getItem(LS_KEY);
+      if (snap) { eng.loadSnapshot(snap); restored = true; }
+    } catch (e) { restored = false; }
+    if (!restored || eng.listMarkets().length === 0) {
+      eng = JoulexEngine.createEngine(JOULEX_DATA);
+      eng.seed();
+    }
+    renderAll();
+  }
+
+  // -- clock -------------------------------------------------------------
+  function renderClock() {
+    var now = eng.now();
+    $("clock-mt").textContent = fmtMT(now.toISOString());
+    $("clock-utc").textContent = fmtUTC(now.toISOString());
+    var open = eng.listMarkets().filter(function (m) { return m.status === "OPEN"; });
+    var next = null;
+    open.forEach(function (m) {
+      var r = new Date(m.resolves_at);
+      if (r > now && (!next || r < next)) next = r;
+    });
+    $("clock-next").textContent = next ?
+      "Next market resolvable: " + fmtMT(next.toISOString()) : "No open markets.";
+  }
+
+  // -- markets -------------------------------------------------------------
+  function marketCard(m) {
+    var now = eng.now();
+    var resolvable = m.status === "OPEN" && now >= new Date(m.resolves_at);
+    var rows = m.outcomes.map(function (o) {
+      var p = m.prices[o];
+      var pos = eng.position(activeAgent, m.market_id, o);
+      return "<div class='outcome'><span class='olabel'>" + esc(o) + "</span>" +
+        "<div class='bar'><div class='fill' style='width:" + (p * 100).toFixed(1) + "%'></div></div>" +
+        "<span class='oprice'>" + (p * 100).toFixed(1) + "¢</span>" +
+        (pos ? "<span class='opos'>you hold " + fmt(pos, 2) + "</span>" : "") +
+        "</div>";
+    }).join("");
+    var trade = "";
+    if (m.status === "OPEN" && now < new Date(m.resolves_at)) {
+      var opts = m.outcomes.map(function (o) {
+        return "<option value='" + esc(o) + "'>" + esc(o) + "</option>";
+      }).join("");
+      trade = "<div class='trade' data-market='" + m.market_id + "'>" +
+        "<select class='tside'>" + opts + "</select>" +
+        "<input class='tshares' type='number' min='0.01' step='0.01' value='10' aria-label='shares'>" +
+        "<button data-action='buy' data-market='" + m.market_id + "'>Buy</button>" +
+        "<button data-action='sell' data-market='" + m.market_id + "'>Sell</button>" +
+        "<span class='quote'></span></div>";
+    }
+    var settle = "";
+    if (resolvable) {
+      if (m.resolution_type === "aeso_price") {
+        settle = "<button class='settle' data-action='settle-aeso' data-market='" + m.market_id + "'>" +
+          "Settle from price series</button>" +
+          "<span class='settle-note'>Max hourly pool price over the window vs $" +
+          fmt(m.strike, 0) + "/MWh strike.</span>";
+      } else {
+        var oopts = m.outcomes.map(function (o) {
+          return "<option value='" + esc(o) + "'>" + esc(o) + "</option>";
+        }).join("");
+        settle = "<div class='settle-box'><select class='settle-outcome'>" + oopts + "</select>" +
+          "<input class='settle-evidence' type='text' placeholder='Evidence URL / source note' " +
+          "value='" + esc(m.resolution_source_url || "") + "'>" +
+          "<button data-action='settle-public' data-market='" + m.market_id + "'>Settle</button></div>" +
+          "<span class='settle-note'>Sandbox operator settlement — production requires " +
+          "operator key + valid attestation.</span>";
+      }
+    }
+    var resolved = "";
+    if (m.status === "RESOLVED") {
+      resolved = "<div class='resolved'>RESOLVED: <b>" + esc(m.outcome) + "</b>" +
+        (m.observed_value !== null && m.observed_value !== undefined ?
+          " — observed max $" + fmt(m.observed_value, 2) + "/MWh" : "") +
+        (m.settlement_source ? " (" + esc(m.settlement_source) + ")" : "") +
+        "<br><span class='dim'>Evidence: " + esc(m.evidence || "—") + "</span></div>";
+    }
+    return "<div class='card' id='card-" + m.market_id + "'>" +
+      "<div class='mkt-q'>" + esc(m.question) + "</div>" +
+      "<div class='mkt-meta'>" + esc(m.contract_type) + " · " + esc(m.resolution_type) +
+      (m.strike !== null && m.strike !== undefined ? " · strike $" + fmt(m.strike, 0) + "/MWh" : "") +
+      " · b=" + fmt(m.b, 0) + " · " + esc(m.status) +
+      " · resolves " + fmtMT(m.resolves_at) + "</div>" +
+      (m.window_start ? "<div class='dim'>Window: " + fmtMT(m.window_start) + " → " + fmtMT(m.window_end) + "</div>" : "") +
+      "<div class='dim'>Source: " + esc(m.resolution_source_description || m.resolution_source_url || "—") + "</div>" +
+      rows + trade + settle + resolved +
+      "<div class='chart-link'><button data-action='chart' data-market='" + m.market_id + "'>" +
+      "Show on price chart</button></div>" +
+      "</div>";
+  }
+
+  function renderMarkets() {
+    var markets = eng.listMarkets();
+    var open = markets.filter(function (m) { return m.status === "OPEN"; });
+    var done = markets.filter(function (m) { return m.status !== "OPEN"; });
+    $("markets-open").innerHTML = open.map(marketCard).join("") ||
+      "<p class='dim'>No open markets. Create one below.</p>";
+    $("markets-resolved").innerHTML = done.map(marketCard).join("") ||
+      "<p class='dim'>Nothing settled yet.</p>";
+    // Cost previews.
+    document.querySelectorAll(".trade").forEach(function (box) {
+      var mid = box.getAttribute("data-market");
+      updateQuote(box, mid);
+    });
+  }
+
+  function updateQuote(box, mid) {
+    var m;
+    try { m = eng.getMarket(mid); } catch (e) { return; }
+    var side = box.querySelector(".tside").value;
+    var shares = parseFloat(box.querySelector(".tshares").value);
+    var q = box.querySelector(".quote");
+    if (!isFinite(shares) || shares <= 0) { q.textContent = ""; return; }
+    var idx = m.outcomes.indexOf(side);
+    try {
+      var cost = JoulexLMSR.tradeCostMulti(m.q, m.b, idx, shares);
+      q.textContent = "Buy " + fmt(shares, 2) + " " + side + " ≈ " + fmt(cost, 4) + " pts" +
+        " (price " + (m.prices[side] * 100).toFixed(1) + "¢)";
+    } catch (e) { q.textContent = ""; }
+  }
+
+  // -- portfolio + ledger ---------------------------------------------------
+  function renderPortfolio() {
+    var bal = eng.balance(activeAgent);
+    $("agent-name").textContent = activeAgent;
+    $("agent-balance").textContent = fmt(bal, 2) + " pts";
+    var pos = eng.positionsFor(activeAgent);
+    $("positions").innerHTML = pos.length ? pos.map(function (p) {
+      var m = null;
+      try { m = eng.getMarket(p.market_id); } catch (e) { return ""; }
+      var value = p.shares * (m.status === "RESOLVED" ?
+        (p.side === m.outcome ? 1 : 0) : m.prices[p.side]);
+      return "<tr><td>" + esc(m.question.slice(0, 60)) + "…</td><td>" + esc(p.side) +
+        "</td><td>" + fmt(p.shares, 2) + "</td><td>" + fmt(value, 2) + " pts</td></tr>";
+    }).join("") : "<tr><td colspan='4' class='dim'>No open positions.</td></tr>";
+    var lv = eng.ledgerView();
+    $("ledger").innerHTML = Object.keys(lv.balances).sort().map(function (a) {
+      return "<tr><td>" + esc(a) + "</td><td>" + fmt(lv.balances[a], 2) + "</td></tr>";
+    }).join("") + "<tr><td>pool (market maker)</td><td>" + fmt(lv.pool, 2) + "</td></tr>";
+    var c = lv.conservation;
+    $("conservation").textContent = c.ok ? "✓ conserved: Σ balances + pool = " +
+      fmt(c.total, 2) + " = " + fmt(c.expected, 2) + " (1,000 × " + c.agents + " agents)" :
+      "✗ BROKEN: total " + fmt(c.total, 2) + " ≠ expected " + fmt(c.expected, 2);
+    $("conservation").className = c.ok ? "ok" : "err";
+  }
+
+  // -- AESO chart ------------------------------------------------------------
+  function renderChart() {
+    var s = JOULEX_DATA.synthetic.stats;
+    $("price-stats").textContent = "SYNTHETIC series: mean $" + s.mean + "/MWh · " +
+      s.zero_hours + " zero-price hours (10.7%) · " + s.cap_hours + " cap hour at $999.99 · " +
+      "max $" + s.max + " · min $" + s.min + ". Built from verified 2025 AESO statistics " +
+      "(avg $43.68/MWh, 10.6% zero-price hours, $999.99 cap). NOT observed AESO data.";
+    var live = JOULEX_DATA.live_snapshot;
+    $("live-snapshot").innerHTML = "<b>LIVE SNAPSHOT — observed AESO data</b> · fetched " +
+      fmtMT(live.fetched_at) + " from the public ETS report<br>" +
+      live.hours.map(function (h) {
+        return fmtMT(h.timestamp) + ": <b>$" + fmt(h.price, 2) + "/MWh</b>";
+      }).join(" · ") +
+      "<br><span class='dim'>Source: " + esc(live.source_url) + "<br>" +
+      "The live report covers only the recent ~3 hours; the historical report returns HTTP 403. " +
+      "A browser cannot fetch this endpoint directly (no CORS headers, plain HTTP) — hence the embedded snapshot.</span>";
+    var cv = $("price-chart");
+    if (!cv || !cv.getContext) return;
+    var ctx = null;
+    try { ctx = cv.getContext("2d"); } catch (e) { ctx = null; }
+    if (!ctx) return; // headless / no canvas: text panels above still render
+    var W = cv.width, H = cv.height;
+    ctx.clearRect(0, 0, W, H);
+    var series = JOULEX_DATA.synthetic.prices;
+    var maxShow = 150; // cap hour $999.99 clipped; labelled below
+    var minT = new Date(series[0].timestamp).getTime();
+    var maxT = new Date(series[series.length - 1].timestamp).getTime();
+    function X(ts) { return 40 + (new Date(ts).getTime() - minT) / (maxT - minT) * (W - 50); }
+    function Y(p) { return H - 25 - Math.min(p, maxShow) / maxShow * (H - 45); }
+    // Window shading for selected market.
+    var sel = null;
+    try { sel = eng.getMarket(chartMarketId); } catch (e) { sel = null; }
+    if (sel && sel.window_start) {
+      ctx.fillStyle = "rgba(255, 200, 0, 0.18)";
+      ctx.fillRect(X(sel.window_start), 10, X(sel.window_end) - X(sel.window_start), H - 35);
+      ctx.fillStyle = "#8a6d00";
+      ctx.font = "11px sans-serif";
+      ctx.fillText("window: " + sel.market_id, X(sel.window_start) + 4, 22);
+    }
+    // Gridlines + labels.
+    ctx.strokeStyle = "#e5e5e5"; ctx.fillStyle = "#666"; ctx.font = "11px sans-serif";
+    [0, 50, 100, 150].forEach(function (v) {
+      ctx.beginPath(); ctx.moveTo(40, Y(v)); ctx.lineTo(W - 10, Y(v)); ctx.stroke();
+      ctx.fillText("$" + v, 4, Y(v) + 4);
+    });
+    // Synthetic line.
+    ctx.strokeStyle = "#2563eb"; ctx.lineWidth = 1.5; ctx.beginPath();
+    series.forEach(function (p, i) {
+      var x = X(p.timestamp), y = Y(p.price);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // Cap hour marker.
+    series.forEach(function (p) {
+      if (p.price >= 999.99) {
+        ctx.fillStyle = "#dc2626";
+        ctx.beginPath(); ctx.arc(X(p.timestamp), Y(150), 4, 0, 7); ctx.fill();
+      }
+    });
+    // Live snapshot points.
+    ctx.fillStyle = "#16a34a";
+    JOULEX_DATA.live_snapshot.hours.forEach(function (p) {
+      ctx.beginPath(); ctx.arc(X(p.timestamp), Y(p.price), 4, 0, 7); ctx.fill();
+    });
+    ctx.fillStyle = "#333"; ctx.font = "12px sans-serif";
+    ctx.fillText("Blue: SYNTHETIC 14-day series (seed 20261110) · Green dots: LIVE SNAPSHOT Nov 12, 05:00–08:00 MT · Red dot: $999.99 cap hour (clipped at $150 for display)",
+      40, H - 6);
+  }
+
+  // -- HCS log ---------------------------------------------------------------
+  function renderLog() {
+    var log = eng.hcsLog();
+    var v = eng.verifyLog();
+    $("log-status").textContent = v.ok ?
+      "✓ Log verifies: " + v.messages + " messages, hash chain intact, sequence continuous." :
+      "✗ LOG BROKEN: " + v.errors.join("; ");
+    $("log-status").className = v.ok ? "ok" : "err";
+    var rows = log.slice(-30).reverse().map(function (m) {
+      return "<tr><td>" + m.sequence + "</td><td>" + esc(m.consensus_timestamp.slice(0, 19)) +
+        "Z (LOCAL)</td><td>" + esc(m.sender) + "</td><td>" + esc(m.action) + "</td>" +
+        "<td class='mono'>" + esc(m.payload_hash.slice(0, 12)) + "…</td></tr>";
+    }).join("");
+    $("log-body").innerHTML = rows || "<tr><td colspan='5' class='dim'>No messages yet.</td></tr>";
+    $("log-count").textContent = log.length + " messages (showing latest 30)";
+  }
+
+  // -- scheduler ---------------------------------------------------------------
+  function runScheduler() {
+    var btn = $("run-scheduler");
+    btn.disabled = true;
+    btn.textContent = "Running…";
+    setTimeout(function () {
+      try {
+        var prices = JOULEX_DATA.synthetic.prices.map(function (p) { return [p.timestamp, p.price]; });
+        var sim = JoulexOrchestrator.runSimulation(prices, JOULEX_DATA.jobs, { sourceLabel: "SYNTHETIC" });
+        var logged = eng.auditScheduler(prices, JOULEX_DATA.jobs, sim.allocations.orchestrator, sim);
+        save();
+        $("scheduler-result").innerHTML =
+          "<table><tr><th>Scheduler</th><th>Energy cost</th><th>SLA</th></tr>" +
+          "<tr><td>fixed (run at arrival)</td><td>$" + fmt(sim.costs.fixed, 2) + "</td><td>" + fmt(sim.sla_pct.fixed, 1) + "%</td></tr>" +
+          "<tr><td>greedy (earliest-deadline-first)</td><td>$" + fmt(sim.costs.greedy, 2) + "</td><td>" + fmt(sim.sla_pct.greedy, 1) + "%</td></tr>" +
+          "<tr><td>orchestrator (net of coordination)</td><td>$" + fmt(sim.costs.orchestrator_net, 2) + "</td><td>" + fmt(sim.sla_pct.orchestrator, 1) + "%</td></tr></table>" +
+          "<p>Improvement vs greedy: <b>" + fmt(sim.improvement_pct.vs_greedy, 2) + "%</b> (target ≥ 5%) · " +
+          "vs fixed: " + fmt(sim.improvement_pct.vs_fixed, 2) + "% · coordination: " +
+          sim.coordination_cost.decisions + " decisions × $0.01 = $" + fmt(sim.coordination_cost.total, 2) + "</p>" +
+          "<p>Annualised saving vs fixed (this simulated job mix): <b>$" +
+          fmt(sim.annualised.saving_per_year_usd, 0) + "/yr</b> ($" +
+          fmt(sim.annualised.saving_per_mwh, 2) + "/MWh over " + fmt(sim.annualised.energy_mwh, 1) +
+          " MWh) — Phase 1 §2.3 band for 1 MW pure arbitrage is tens of thousands/yr, not hundreds of thousands.</p>" +
+          "<p><b>VERDICT: " + sim.verdict + "</b> — " + esc(sim.verdict_reason) + "</p>" +
+          "<p class='dim'>" + logged + " allocation decisions + summary written to the HCS audit log " +
+          "(auditable 100%). price-only is not the bar: it cheats on SLA (" +
+          fmt(sim.sla_pct.price_only, 1) + "%).</p>";
+        notice("Scheduler run complete: " + sim.verdict + " — " + sim.improvement_pct.vs_greedy.toFixed(2) + "% vs greedy.");
+        renderAll();
+      } catch (e) {
+        notice("Scheduler failed: " + e.message, true);
+      }
+      btn.disabled = false;
+      btn.textContent = "Run scheduler on SYNTHETIC series";
+    }, 30);
+  }
+
+  // -- actions ---------------------------------------------------------------
+  // One failing panel must never brick the rest: each renderer is
+  // isolated, and handlers are wired before init() runs, so a render
+  // error cannot leave the page unresponsive.
+  function renderAll() {
+    ["renderClock", "renderMarkets", "renderPortfolio", "renderChart", "renderLog"].forEach(function (fn) {
+      try {
+        ({ renderClock: renderClock, renderMarkets: renderMarkets,
+           renderPortfolio: renderPortfolio, renderChart: renderChart,
+           renderLog: renderLog })[fn]();
+      } catch (e) {
+        if (window.console && console.error) console.error(fn + " failed: " + e.message);
+      }
+    });
+  }
+
+  function doTrade(marketId, action) {
+    var box = document.querySelector(".trade[data-market='" + marketId + "']");
+    if (!box) return;
+    var side = box.querySelector(".tside").value;
+    var shares = parseFloat(box.querySelector(".tshares").value);
+    try {
+      var r = eng.placeOrder(activeAgent, { market_id: marketId, side: side, shares: shares, action: action });
+      save();
+      notice(action + " " + fmt(shares, 2) + " " + side + " on " + marketId +
+        " for " + fmt(Math.abs(r.cost_points), 4) + " pts. Balance: " + fmt(r.balance_after, 2) + " pts.");
+      renderAll();
+    } catch (e) {
+      notice("Order refused (" + (e.status || "?") + "): " + (e.reason || e.message), true);
+    }
+  }
+
+  function doSettle(marketId, kind, card) {
+    try {
+      var receipt;
+      if (kind === "aeso") {
+        receipt = eng.settleMarket(marketId, {});
+      } else {
+        var outcome = card.querySelector(".settle-outcome").value;
+        var evidence = card.querySelector(".settle-evidence").value.trim();
+        receipt = eng.settleMarket(marketId, { outcome: outcome, evidence: evidence });
+      }
+      save();
+      notice("Settled " + marketId + ": " + receipt.outcome +
+        (receipt.observed_value !== null && receipt.observed_value !== undefined ?
+          " (observed max $" + fmt(receipt.observed_value, 2) + "/MWh, " + receipt.settlement_source + ")" : "") +
+        ". Payouts: " + receipt.payouts.filter(function (p) { return p.payout_points > 0; })
+          .map(function (p) { return p.agent_id + " +" + fmt(p.payout_points, 2); }).join(", "));
+      renderAll();
+    } catch (e) {
+      notice("Settlement refused (" + (e.status || "?") + "): " + (e.reason || e.message), true);
+    }
+  }
+
+  function doCreateMarket() {
+    var f = $("create-form");
+    var type = f.querySelector("[name=rectype]").value;
+    var fields = {
+      question: f.querySelector("[name=question]").value,
+      resolution_type: type === "aeso" ? "aeso_price" : "public_source",
+      contract_type: type === "aeso" ? "flex_capacity" :
+        (type === "compute" ? "compute_forward" : "generic"),
+      resolves_at: new Date(f.querySelector("[name=resolves_at]").value).toISOString(),
+      b: parseFloat(f.querySelector("[name=b]").value) || 100,
+      created_by: activeAgent
+    };
+    if (type === "aeso") {
+      fields.strike = parseFloat(f.querySelector("[name=strike]").value);
+      fields.window_start = new Date(f.querySelector("[name=window_start]").value).toISOString();
+      fields.window_end = new Date(f.querySelector("[name=window_end]").value).toISOString();
+    } else {
+      fields.source_url = f.querySelector("[name=source_url]").value;
+      fields.source_description = f.querySelector("[name=source_description]").value;
+      var oc = f.querySelector("[name=outcomes]").value.trim();
+      if (oc) fields.outcomes = oc.split(",").map(function (s) { return s.trim(); }).filter(Boolean);
+    }
+    try {
+      var m = eng.createMarket(fields);
+      save();
+      notice("Market created: " + m.market_id + " — " + m.question);
+      f.reset();
+      renderAll();
+    } catch (e) {
+      notice("Market creation refused (" + (e.status || "?") + "): " + (e.reason || e.message), true);
+    }
+  }
+
+  function toggleCreateFields() {
+    var type = document.querySelector("#create-form [name=rectype]").value;
+    document.querySelectorAll("#create-form .aeso-only").forEach(function (el) {
+      el.style.display = type === "aeso" ? "block" : "none";
+    });
+    document.querySelectorAll("#create-form .public-only").forEach(function (el) {
+      el.style.display = type === "aeso" ? "none" : "block";
+    });
+  }
+
+  function jumpNext() {
+    var now = eng.now();
+    var next = null;
+    eng.listMarkets().forEach(function (m) {
+      if (m.status !== "OPEN") return;
+      var r = new Date(m.resolves_at);
+      if (r > now && (!next || r < next)) next = r;
+    });
+    if (!next) { notice("No open market left to jump to."); return; }
+    var hours = Math.ceil((next.getTime() - now.getTime()) / 3600000) + 1;
+    eng.advanceClock(hours);
+    save();
+    notice("Clock advanced " + hours + "h to " + fmtMT(eng.now().toISOString()) + ".");
+    renderAll();
+  }
+
+  function autoTrade() {
+    var markets = eng.listMarkets().filter(function (m) {
+      return m.status === "OPEN" && eng.now() < new Date(m.resolves_at);
+    });
+    if (!markets.length) return;
+    var m = markets[Math.floor(Math.random() * markets.length)];
+    var agent = Math.random() < 0.5 ? "alice" : "bob";
+    var side = m.outcomes[Math.floor(Math.random() * m.outcomes.length)];
+    var shares = 1 + Math.floor(Math.random() * 5);
+    try {
+      eng.placeOrder(agent, { market_id: m.market_id, side: side, shares: shares, action: "buy" });
+      save();
+      renderMarkets(); renderPortfolio(); renderLog();
+    } catch (e) { /* insufficient points etc. — skip quietly */ }
+  }
+
+  // -- wire up ---------------------------------------------------------------
+  document.addEventListener("DOMContentLoaded", function () {
+    // Wire handlers FIRST: init() renders, and a render failure must
+    // never leave the page without working controls.
+    toggleCreateFields();
+    document.body.addEventListener("click", function (ev) {
+      var t = ev.target;
+      var action = t.getAttribute && t.getAttribute("data-action");
+      if (!action) return;
+      if (action === "buy" || action === "sell") doTrade(t.getAttribute("data-market"), action);
+      if (action === "settle-aeso") doSettle(t.getAttribute("data-market"), "aeso", t.closest(".card"));
+      if (action === "settle-public") doSettle(t.getAttribute("data-market"), "public", t.closest(".card"));
+      if (action === "chart") {
+        chartMarketId = t.getAttribute("data-market");
+        renderChart();
+        document.getElementById("price-panel").scrollIntoView({ behavior: "smooth" });
+      }
+    });
+    document.body.addEventListener("input", function (ev) {
+      var box = ev.target.closest && ev.target.closest(".trade");
+      if (box) updateQuote(box, box.getAttribute("data-market"));
+    });
+    document.body.addEventListener("change", function (ev) {
+      if (ev.target && ev.target.name === "rectype") toggleCreateFields();
+      if (ev.target && ev.target.id === "auto-trader") {
+        if (ev.target.checked) { autoTimer = setInterval(autoTrade, 5000); }
+        else if (autoTimer) { clearInterval(autoTimer); autoTimer = null; }
+      }
+    });
+    $("advance-1h").addEventListener("click", function () { eng.advanceClock(1); save(); renderAll(); });
+    $("advance-6h").addEventListener("click", function () { eng.advanceClock(6); save(); renderAll(); });
+    $("advance-24h").addEventListener("click", function () { eng.advanceClock(24); save(); renderAll(); });
+    $("jump-next").addEventListener("click", jumpNext);
+    $("run-scheduler").addEventListener("click", runScheduler);
+    $("create-market").addEventListener("click", doCreateMarket);
+    $("reset-sandbox").addEventListener("click", function () {
+      try { localStorage.removeItem(LS_KEY); } catch (e) {}
+      eng = JoulexEngine.createEngine(JOULEX_DATA);
+      eng.seed();
+      save();
+      notice("Sandbox reset to seed state.");
+      renderAll();
+    });
+    document.querySelectorAll("[data-agent]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        activeAgent = b.getAttribute("data-agent");
+        document.querySelectorAll("[data-agent]").forEach(function (x) {
+          x.classList.toggle("active", x === b);
+        });
+        renderMarkets(); renderPortfolio();
+      });
+    });
+    init();
+  });
+})();
+</script>
+</body>
+</html>

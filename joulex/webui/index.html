@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>JouleX — paper-only agent exchange</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 1em; }
+  #banner { background: #fff3cd; border: 1px solid #d4a017; padding: 0.6em; font-weight: bold; }
+  section { border-top: 1px solid #ccc; margin-top: 1em; padding-top: 0.5em; }
+  .market-card { border: 1px solid #999; padding: 0.6em; margin: 0.4em 0; }
+  button { margin: 0.2em 0.2em 0.2em 0; }
+  input, select { margin: 0.2em 0.2em 0.2em 0; }
+  pre { background: #f4f4f4; padding: 0.5em; overflow-x: auto; }
+  table { border-collapse: collapse; }
+  td, th { border: 1px solid #ccc; padding: 0.2em 0.5em; text-align: left; }
+</style>
+</head>
+<body>
+<div id="banner">PAPER ONLY — no real money, no real electricity, no live Hedera settlement. Demo data; nothing here is a real trade.</div>
+<h1>JouleX</h1>
+<p>Autonomous AI-agent exchange for electricity flexibility and compute — paper trading on the live API. Create an account, load a demo agent, place your first paper trade.</p>
+<p id="health-line">Connecting…</p>
+<p id="aeso-price">AESO pool price: loading…</p>
+<p id="notice"></p>
+
+<section id="account-section">
+  <h2>Account</h2>
+  <label>Email <input id="account-email" type="email" placeholder="you@example.com"></label>
+  <label>Password <input id="account-password" type="password" placeholder="12+ characters"></label>
+  <label>Display name <input id="account-name" type="text" placeholder="Alice"></label>
+  <label>Role
+    <select id="account-role">
+      <option value="buyer">buyer</option>
+      <option value="generator">generator</option>
+      <option value="provider">provider</option>
+      <option value="operator">operator</option>
+    </select>
+  </label><br>
+  <button id="register-btn">Register</button>
+  <button id="login-btn">Log in</button>
+  <button id="logout-btn">Log out</button>
+  <p id="account-status">Not logged in.</p>
+</section>
+
+<section id="agent-section">
+  <h2>Demo agent</h2>
+  <p>Trading needs a CF-KYA L3 agent credential. On this demo server you can load a throwaway demo agent (keys are demo-only; the seed is held in page memory only and never stored).</p>
+  <button id="demo-agent-btn">Load demo agent Alice</button>
+  <button id="link-agent-btn">Link agent to my account</button>
+  <p id="agent-status">No agent loaded.</p>
+</section>
+
+<section id="markets-section">
+  <h2>Markets</h2>
+  <div id="markets-list">Loading markets…</div>
+</section>
+
+<section id="order-section">
+  <h2>Order</h2>
+  <label>Market <select id="order-market"></select></label>
+  <label>Side
+    <select id="order-side">
+      <option value="YES">YES</option>
+      <option value="NO">NO</option>
+    </select>
+  </label>
+  <label>Shares <input id="order-shares" type="number" min="1" step="1" value="10"></label>
+  <label>Action
+    <select id="order-action">
+      <option value="buy">buy</option>
+      <option value="sell">sell</option>
+    </select>
+  </label>
+  <button id="place-order-btn">Place order</button>
+  <pre id="order-result">No order yet.</pre>
+</section>
+
+<section id="positions-section">
+  <h2>Positions</h2>
+  <div id="positions-list">Load a demo agent and trade to see positions.</div>
+</section>
+
+<section id="ledger-section">
+  <h2>Ledger</h2>
+  <div id="ledger-view">Loading ledger…</div>
+</section>
+
+<section id="audit-section">
+  <h2>Audit trail</h2>
+  <button id="audit-verify-btn">Verify log</button>
+  <span id="audit-verify-result"></span>
+  <table id="audit-log">
+    <thead><tr><th>seq</th><th>action</th><th>agent</th><th>time</th></tr></thead>
+    <tbody></tbody>
+  </table>
+</section>
+
+<script src="/app/sha256.js"></script>
+<script src="/app/ed25519.js"></script>
+<script src="/app/app.js"></script>
+</body>
+</html>

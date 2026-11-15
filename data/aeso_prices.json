@@ -1,0 +1,25 @@
+{
+  "source": "AESO CSMPriceReportServlet (live SMP, keyless public report)",
+  "source_url": "http://ets.aeso.ca/ets_web/ip/Market/Reports/CSMPriceReportServlet?contentType=csv",
+  "fetched_at": "2026-11-10T06:51:19.792400+00:00",
+  "label": "REAL",
+  "hours": [
+    {
+      "timestamp": "2026-11-09T21:00:00-06:00",
+      "price": 15.794
+    },
+    {
+      "timestamp": "2026-11-09T22:00:00-06:00",
+      "price": 16.385714285714286
+    },
+    {
+      "timestamp": "2026-11-09T23:00:00-06:00",
+      "price": 22.261428571428574
+    },
+    {
+      "timestamp": "2026-11-10T00:00:00-06:00",
+      "price": 21.776666666666667
+    }
+  ],
+  "note": "Live SMP report covers only the recent ~3 hours. Multi-day history unavailable from this VM: PoolPriceReportServlet returns HTTP 403 (verified 2026-11-10, no params and startDate/endDate forms). No AESO APIM key created (owner step). This cache is therefore INSUFFICIENT for the M2 multi-day simulation; the simulator uses the labelled SYNTHETIC series (see joulex/aeso_synthetic.py)."
+}

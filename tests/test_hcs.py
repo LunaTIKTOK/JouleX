@@ -1,0 +1,302 @@
+"""M1 — HCS-schema audit log tests (test-first).
+
+Covers DESIGN.md §7.3: append/sequence/hash-chain, the LOCAL label,
+what_did_agent_know / who_told_whom queries, verify_log on a tampered
+log, corrupt-log startup refusal, RealHCS live submission (fake
+transport) and local-first failure behaviour. Append-only: no
+edit/delete/rewrite API exists.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from joulex.hcs import (
+    TOPIC,
+    HCSClient,
+    LocalHCS,
+    RealHCS,
+    format_hcs_timestamp,
+    load_hcs_config,
+    make_hcs,
+    verify_log_file,
+)
+
+T0 = datetime(2026, 11, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _append(hcs, sender, action, payload, **kw):
+    return hcs.append(sender=sender, action=action, payload=payload, **kw)
+
+
+def test_header_labels_local_simulation(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    lines = (tmp_path / "hcs_log.jsonl").read_text().splitlines()
+    assert len(lines) == 1
+    header = json.loads(lines[0])
+    assert header == {"mode": "local", "hedera_topic": None}
+
+
+def test_append_sequence_and_hash_chain(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    m1 = _append(hcs, "agent-a", "place_order", {"market_id": "m1"}, now=T0)
+    m2 = _append(hcs, "agent-b", "place_order", {"market_id": "m1"}, now=T0 + timedelta(seconds=1))
+    assert m1["topic"] == TOPIC
+    assert m1["sequence"] == 1
+    assert m2["sequence"] == 2
+    assert m1["prev_hash"] == "0" * 64
+    assert m2["prev_hash"] == m1["message_hash"]
+    assert m1["consensus_timestamp"] == "2026-11-09T12:00:00.000000000Z"
+    assert m2["consensus_timestamp"] == "2026-11-09T12:00:01.000000000Z"
+    assert format_hcs_timestamp(T0) == "2026-11-09T12:00:00.000000000Z"
+    report = hcs.verify_log()
+    assert report["ok"] is True and report["messages"] == 2
+    assert report["errors"] == []
+
+
+def test_append_only_no_mutation_api():
+    for name in ("delete", "edit", "rewrite", "remove", "update", "truncate"):
+        assert not hasattr(LocalHCS, name), name
+    assert not hasattr(HCSClient, "delete")
+
+
+def test_what_did_agent_know(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-a", "place_order", {"market_id": "m1"}, now=T0,
+            provenance={"told_by": "exchange", "known_facts": ["f0" * 16]})
+    _append(hcs, "agent-b", "place_order", {"market_id": "m1"}, now=T0 + timedelta(seconds=10),
+            provenance={"told_by": "agent-a", "known_facts": []})
+    _append(hcs, "agent-a", "place_order", {"market_id": "m2"}, now=T0 + timedelta(seconds=20))
+    # At T0+15s agent-a knows: its own first order (as sender) + the
+    # second order (as told_by target). Not the third (after t).
+    known = hcs.what_did_agent_know("agent-a", T0 + timedelta(seconds=15))
+    hashes = set(known["known_facts"])
+    import hashlib
+    from joulex.attestation import canonical_bytes
+    h1 = hashlib.sha256(canonical_bytes({"market_id": "m1"})).hexdigest()
+    h2 = hashlib.sha256(canonical_bytes({"market_id": "m1"})).hexdigest()
+    assert h1 in hashes
+    assert "f0" * 16 in hashes  # known_facts the agent had seen at mint time
+    assert len(known["messages"]) == 2
+    # Before anything happened, the agent knows nothing.
+    assert hcs.what_did_agent_know("agent-a", T0 - timedelta(seconds=1))["known_facts"] == []
+
+
+def test_who_told_whom(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-b", "place_order", {"market_id": "m1"}, now=T0,
+            provenance={"told_by": "agent-a", "known_facts": []})
+    _append(hcs, "agent-b", "place_order", {"market_id": "m2"}, now=T0 + timedelta(seconds=5),
+            provenance={"told_by": "exchange", "known_facts": []})
+    _append(hcs, "agent-a", "place_order", {"market_id": "m1"}, now=T0 + timedelta(seconds=10),
+            provenance={"told_by": "agent-b", "known_facts": []})
+    told = hcs.who_told_whom("agent-a", "agent-b")
+    assert len(told) == 1
+    assert told[0]["payload"]["market_id"] == "m1"
+    # Time window filters.
+    assert hcs.who_told_whom("agent-a", "agent-b", t0=T0 + timedelta(seconds=1)) == []
+    assert len(hcs.who_told_whom("agent-b", "agent-a")) == 1
+
+
+def test_verify_log_tampered_payload_fails(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-a", "place_order", {"market_id": "m1"}, now=T0)
+    _append(hcs, "agent-a", "place_order", {"market_id": "m2"}, now=T0 + timedelta(seconds=1))
+    path = tmp_path / "hcs_log.jsonl"
+    lines = path.read_text().splitlines()
+    msg = json.loads(lines[1])
+    msg["payload"] = {"market_id": "mX"}
+    lines[1] = json.dumps(msg, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n")
+    report = verify_log_file(str(path))
+    assert report["ok"] is False
+    assert report["errors"], "tampered payload must be reported"
+
+
+def test_verify_log_sequence_gap_fails(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-a", "place_order", {"x": 1}, now=T0)
+    _append(hcs, "agent-a", "place_order", {"x": 2}, now=T0 + timedelta(seconds=1))
+    path = tmp_path / "hcs_log.jsonl"
+    lines = path.read_text().splitlines()
+    msg = json.loads(lines[2])
+    msg["sequence"] = 99
+    lines[2] = json.dumps(msg, sort_keys=True)
+    path.write_text("\n".join(lines) + "\n")
+    with pytest.raises(RuntimeError):
+        LocalHCS(str(tmp_path))
+
+
+def test_corrupt_log_refuses_startup(tmp_path):
+    path = tmp_path / "hcs_log.jsonl"
+    path.write_text('{"mode": "local", "hedera_topic": null}\n{not json\n')
+    with pytest.raises(RuntimeError):
+        LocalHCS(str(tmp_path))
+    path.write_text('{"mode": "hedera", "hedera_topic": "0.0.1"}\n')
+    with pytest.raises(RuntimeError):
+        LocalHCS(str(tmp_path))
+
+
+def test_log_reopens_and_continues_sequence(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-a", "place_order", {"x": 1}, now=T0)
+    hcs2 = LocalHCS(str(tmp_path))
+    m = _append(hcs2, "agent-a", "place_order", {"x": 2}, now=T0 + timedelta(seconds=1))
+    assert m["sequence"] == 2
+    assert hcs2.verify_log()["ok"] is True
+
+
+def test_real_hcs_requires_config(tmp_path):
+    with pytest.raises(RuntimeError):
+        RealHCS(str(tmp_path), operator_account_id="", topic_id="0.0.1")
+    with pytest.raises(RuntimeError):
+        RealHCS(str(tmp_path), operator_account_id="0.0.1", topic_id="")
+    with pytest.raises(RuntimeError):
+        RealHCS(str(tmp_path), operator_account_id="0.0.1", topic_id="0.0.1", network="previewnet")
+
+
+def _fake_runner(receipt=None, fail=None):
+    calls = []
+
+    def runner(message_bytes, *, operator_account_id, topic_id, network):
+        calls.append(
+            {
+                "message_bytes": message_bytes,
+                "operator_account_id": operator_account_id,
+                "topic_id": topic_id,
+                "network": network,
+            }
+        )
+        if fail is not None:
+            raise fail
+        return receipt or {
+            "status": "SUCCESS",
+            "topic_sequence": "42",
+            "consensus_timestamp": "2026-11-10T12:00:00.000000000Z",
+            "transaction_id": "0.0.1@1794333600.000000000",
+        }
+
+    runner.calls = calls
+    return runner
+
+
+def _real(tmp_path, runner, monkeypatch):
+    monkeypatch.setenv("JOULEX_HCS_PRIVATE_KEY", "0x" + "ab" * 32)
+    return RealHCS(
+        str(tmp_path),
+        operator_account_id="0.0.11389089",
+        topic_id="0.0.11399235",
+        network="testnet",
+        runner=runner,
+        queue_retry_delays=(0, 0, 0, 0),
+        queue_max_attempts=3,
+    )
+
+
+def test_real_hcs_submit_uses_runner(tmp_path, monkeypatch):
+    runner = _fake_runner()
+    real = _real(tmp_path, runner, monkeypatch)
+    out = real.submit({"sender": "agent-a", "action": "place_order", "payload": {"x": 1}})
+    assert out["hedera"]["status"] == "SUCCESS"
+    assert out["hedera"]["topic_sequence"] == "42"
+    assert out["hedera"]["topic"] == "0.0.11399235"
+    assert len(runner.calls) == 1
+    call = runner.calls[0]
+    assert call["operator_account_id"] == "0.0.11389089"
+    assert call["topic_id"] == "0.0.11399235"
+    assert call["network"] == "testnet"
+    assert json.loads(call["message_bytes"])["payload"] == {"x": 1}
+
+
+def test_real_hcs_submit_missing_key(tmp_path, monkeypatch):
+    monkeypatch.delenv("JOULEX_HCS_PRIVATE_KEY", raising=False)
+    runner = _fake_runner()
+    real = RealHCS(
+        str(tmp_path),
+        operator_account_id="0.0.11389089",
+        topic_id="0.0.11399235",
+        runner=runner,
+    )
+    with pytest.raises(RuntimeError):
+        real.submit({"sender": "a", "action": "x", "payload": {}})
+    assert runner.calls == []
+
+
+def test_real_hcs_append_writes_local_then_submits(tmp_path, monkeypatch):
+    runner = _fake_runner()
+    real = _real(tmp_path, runner, monkeypatch)
+    msg = real.append(sender="agent-a", action="place_order", payload={"x": 1}, now=T0)
+    assert msg["sequence"] == 1
+    # M4: append enqueues (no submit on the trade path); the worker
+    # drains the job and the receipt lands.
+    assert msg["hedera"]["status"] == "queued"
+    assert len(runner.calls) == 0
+    assert real.drain_anchors()[0]["status"] == "anchored"
+    assert real.receipt_for(1)["status"] == "SUCCESS"
+    assert real.receipt_for(1)["topic_sequence"] == "42"
+    assert real.verify_log()["ok"] is True
+    assert len(real.messages()) == 1
+
+
+def test_real_hcs_append_submit_failure_keeps_local_record(tmp_path, monkeypatch):
+    runner = _fake_runner(fail=RuntimeError("network down"))
+    real = _real(tmp_path, runner, monkeypatch)
+    msg = real.append(sender="agent-a", action="place_order", payload={"x": 1}, now=T0)
+    assert msg["sequence"] == 1
+    assert msg["hedera"]["status"] == "queued"
+    # The failure surfaces on drain, not on append — and the local
+    # record survives either way.
+    done = real.drain_anchors()
+    assert done[-1]["status"] == "dead"
+    assert "network down" in done[-1]["error"]
+    assert real.verify_log()["ok"] is True
+    assert len(real.messages()) == 1
+
+
+def test_real_hcs_reads_delegate_to_local(tmp_path, monkeypatch):
+    runner = _fake_runner()
+    real = _real(tmp_path, runner, monkeypatch)
+    real.append(sender="agent-a", action="place_order", payload={"m": 1}, now=T0,
+                provenance={"told_by": "exchange", "known_facts": []})
+    assert len(real.messages()) == 1
+    known = real.what_did_agent_know("agent-a", T0 + timedelta(seconds=5))
+    assert len(known["messages"]) == 1
+    assert real.who_told_whom("exchange", "agent-a") != []
+    assert real.verify_log()["ok"] is True
+
+
+def test_load_hcs_config(tmp_path):
+    assert load_hcs_config(str(tmp_path)) == {"mode": "local", "hedera_topic": None, "network": "testnet"}
+    (tmp_path / "hcs_config.json").write_text(
+        json.dumps({"mode": "hedera", "hedera_topic": "0.0.11399235", "network": "testnet"})
+    )
+    cfg = load_hcs_config(str(tmp_path))
+    assert cfg["hedera_topic"] == "0.0.11399235"
+    assert cfg["mode"] == "hedera"
+
+
+def test_make_hcs_factory(tmp_path, monkeypatch):
+    monkeypatch.delenv("JOULEX_HCS_MODE", raising=False)
+    assert isinstance(make_hcs(str(tmp_path)), LocalHCS)
+    (tmp_path / "hcs_config.json").write_text(
+        json.dumps({"mode": "hedera", "hedera_topic": "0.0.11399235", "network": "testnet"})
+    )
+    # Mode flag on but no operator: fail closed, never silently local.
+    monkeypatch.setenv("JOULEX_HCS_MODE", "hedera")
+    monkeypatch.delenv("JOULEX_HCS_OPERATOR", raising=False)
+    with pytest.raises(RuntimeError):
+        make_hcs(str(tmp_path))
+    monkeypatch.setenv("JOULEX_HCS_OPERATOR", "0.0.11389089")
+    assert isinstance(make_hcs(str(tmp_path)), RealHCS)
+
+
+def test_timestamp_monotonicity_enforced(tmp_path):
+    hcs = LocalHCS(str(tmp_path))
+    _append(hcs, "agent-a", "place_order", {"x": 1}, now=T0 + timedelta(seconds=10))
+    _append(hcs, "agent-a", "place_order", {"x": 2}, now=T0)  # earlier!
+    report = hcs.verify_log()
+    assert report["ok"] is False
+    assert any("timestamp" in e.lower() for e in report["errors"])

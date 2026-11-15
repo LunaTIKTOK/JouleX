@@ -1,0 +1,12 @@
+# Dependencies (reinstallable; node_modules is 237M)
+node_modules/
+# Python caches
+__pycache__/
+.pytest_cache/
+*.pyc
+# Local-only demo state (regenerated; never push operator data)
+# data/ is intentionally TRACKED (seed ledger, HCS log, demo trust store)
+# — it holds no secrets. Uncomment to exclude live state later:
+# data/hcs_log.jsonl
+# Editor / OS
+.DS_Store

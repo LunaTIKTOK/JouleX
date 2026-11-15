@@ -1,0 +1,516 @@
+"""HCS-schema audit log — DESIGN.md §7.3 (M1).
+
+Every agent action (order, market creation, settlement, attestation
+verification result) appends one ordered message to
+``data/hcs_log.jsonl``. The schema mirrors Hedera Consensus Service
+semantics: topic, strictly increasing sequence, consensus timestamp in
+HCS nanosecond format, sender, action, payload hash, attestation,
+provenance (who told whom / what was known), and a hash chain.
+
+HONEST LABELLING: the log file header records
+``{"mode": "local", "hedera_topic": null}``. The timestamp is a LOCAL
+simulation of a consensus timestamp, never a Hedera consensus
+timestamp. Going live on real Hedera is an owner step (docs/HEDERA.md);
+``RealHCS`` submits to a real topic and records the receipt alongside
+the local copy, but the local log stays the fallback and replay source
+either way.
+
+The log is append-only. There is no edit, delete, or rewrite API. A
+corrupt log refuses startup (fail closed), like the challenge store:
+``LocalHCS`` raises ``RuntimeError`` on load when the header is wrong,
+a line is malformed, or ``verify_log`` reports a break.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from typing import Any
+
+from .attestation import canonical_bytes
+
+TOPIC = "joulex-actions"
+FILENAME = "hcs_log.jsonl"
+HEADER = {"mode": "local", "hedera_topic": None}
+GENESIS_PREV_HASH = "0" * 64
+
+_HCS_SUBMIT_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hcs_submit.mjs"
+)
+_NETWORKS = ("testnet", "mainnet")
+_KEY_ENV = "JOULEX_HCS_PRIVATE_KEY"
+_OPERATOR_ENV = "JOULEX_HCS_OPERATOR"
+_MODE_ENV = "JOULEX_HCS_MODE"
+
+
+def format_hcs_timestamp(dt: datetime) -> str:
+    """HCS nanosecond format: ``2026-11-09T23:52:00.000000000Z``.
+
+    Python datetimes carry microseconds; the last three digits are
+    zero (nanosecond precision is not available, and the value is
+    labelled LOCAL anyway — see the module docstring)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond * 1000:09d}Z"
+
+
+def parse_hcs_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+def _parse_time(value: Any) -> datetime:
+    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _message_hash(message: dict[str, Any]) -> str:
+    """SHA-256 over the canonical bytes of the message, excluding
+    ``message_hash`` itself."""
+    body = {k: v for k, v in message.items() if k != "message_hash"}
+    return hashlib.sha256(canonical_bytes(body)).hexdigest()
+
+
+def _payload_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(canonical_bytes(payload)).hexdigest()
+
+
+def verify_log_file(path: str) -> dict[str, Any]:
+    """Re-walk a log file from disk: header, sequence continuity,
+    hash-chain integrity, payload-hash integrity, timestamp
+    monotonicity. Returns ``{"ok", "messages", "errors"}``; any break
+    is a hard failure, reported, never silently repaired."""
+    errors: list[str] = []
+    messages: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except OSError as exc:
+        return {"ok": False, "messages": 0, "errors": [f"unreadable log: {exc}"]}
+    if not lines:
+        return {"ok": False, "messages": 0, "errors": ["empty log: missing header"]}
+    try:
+        header = json.loads(lines[0])
+    except ValueError as exc:
+        return {"ok": False, "messages": 0, "errors": [f"corrupt header: {exc}"]}
+    if header != HEADER:
+        errors.append(f"bad header: {header!r} (expected {HEADER!r})")
+    for i, line in enumerate(lines[1:], start=2):
+        if not line.strip():
+            errors.append(f"line {i}: blank line in log")
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            errors.append(f"line {i}: malformed JSON: {exc}")
+            continue
+        if not isinstance(msg, dict):
+            errors.append(f"line {i}: message is not an object")
+            continue
+        messages.append(msg)
+    prev_hash = GENESIS_PREV_HASH
+    prev_ts: datetime | None = None
+    for idx, msg in enumerate(messages):
+        n = idx + 1
+        if msg.get("sequence") != n:
+            errors.append(
+                f"message {n}: sequence {msg.get('sequence')!r} != expected {n}"
+            )
+        if msg.get("topic") != TOPIC:
+            errors.append(f"message {n}: topic {msg.get('topic')!r} != {TOPIC!r}")
+        if msg.get("prev_hash") != prev_hash:
+            errors.append(f"message {n}: prev_hash breaks the chain")
+        if msg.get("message_hash") != _message_hash(msg):
+            errors.append(f"message {n}: message_hash mismatch (tampered content)")
+        payload = msg.get("payload")
+        if isinstance(payload, dict):
+            if msg.get("payload_hash") != _payload_hash(payload):
+                errors.append(f"message {n}: payload_hash mismatch")
+        else:
+            errors.append(f"message {n}: payload is not an object")
+        try:
+            ts = parse_hcs_timestamp(str(msg.get("consensus_timestamp")))
+        except ValueError:
+            errors.append(f"message {n}: bad consensus_timestamp")
+            ts = None
+        if ts is not None and prev_ts is not None and ts < prev_ts:
+            errors.append(f"message {n}: consensus_timestamp goes backwards")
+        if ts is not None:
+            prev_ts = ts
+        if isinstance(msg.get("message_hash"), str):
+            prev_hash = str(msg["message_hash"])
+    return {"ok": not errors, "messages": len(messages), "errors": errors}
+
+
+class HCSClient:
+    """Interface for the audit-log sink. ``LocalHCS`` is the local
+    simulation; ``RealHCS`` submits to a real Hedera HCS topic (see
+    docs/HEDERA.md) while keeping the local log as the fallback and
+    replay source."""
+
+    def append(self, *, sender: str, action: str, payload: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def submit(self, message: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def messages(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def what_did_agent_know(self, agent_id: str, t: datetime | str) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def who_told_whom(
+        self,
+        agent_a: str,
+        agent_b: str,
+        t0: datetime | str | None = None,
+        t1: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+    def verify_log(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+
+class LocalHCS(HCSClient):
+    """LIVE in v1: the local HCS-schema log at ``<data_dir>/hcs_log.jsonl``.
+
+    The first line is the header ``{"mode": "local", "hedera_topic":
+    null}``. Startup re-walks the whole log (``verify_log_file``) and
+    refuses to start on any corruption — fail closed."""
+
+    def __init__(self, data_dir: str, *, now_fn=None):
+        self.data_dir = data_dir
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        os.makedirs(data_dir, exist_ok=True)
+        self._path = os.path.join(data_dir, FILENAME)
+        if not os.path.exists(self._path):
+            with open(self._path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(HEADER, sort_keys=True) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+        report = verify_log_file(self._path)
+        if not report["ok"]:
+            raise RuntimeError(
+                "refusing to start: corrupt HCS audit log: "
+                + "; ".join(report["errors"])
+            )
+        self._messages: list[dict[str, Any]] = self._read_messages()
+
+    def _read_messages(self) -> list[dict[str, Any]]:
+        with open(self._path, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        return [json.loads(line) for line in lines[1:] if line.strip()]
+
+    def now(self) -> datetime:
+        return self._now_fn()
+
+    # -- append --------------------------------------------------------
+    def append(
+        self,
+        *,
+        sender: str,
+        action: str,
+        payload: dict[str, Any],
+        attestation: dict[str, Any] | None = None,
+        provenance: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Append one ordered message. ``provenance`` is
+        ``{"told_by": <agent_id or 'exchange' or 'aeso-oracle'>,
+        "known_facts": [<payload hashes the actor had seen>]}``.
+        Returns the appended message (with sequence, consensus
+        timestamp, hashes assigned)."""
+        ts = now or self.now()
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        prev = self._messages[-1] if self._messages else None
+        message: dict[str, Any] = {
+            "topic": TOPIC,
+            "sequence": (prev["sequence"] + 1) if prev else 1,
+            "consensus_timestamp": format_hcs_timestamp(ts),
+            "sender": str(sender),
+            "action": str(action),
+            "payload_hash": _payload_hash(payload),
+            "payload": payload,
+            "attestation": attestation,
+            "provenance": provenance or {"told_by": None, "known_facts": []},
+            "prev_hash": prev["message_hash"] if prev else GENESIS_PREV_HASH,
+        }
+        message["message_hash"] = _message_hash(message)
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(message, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        self._messages.append(message)
+        return dict(message)
+
+    def submit(self, message: dict[str, Any]) -> dict[str, Any]:
+        """Local submit == append with the caller-supplied fields.
+        (The name exists so LocalHCS and the future RealHCS share the
+        HCSClient shape; the exchange uses ``append``.)"""
+        return self.append(
+            sender=str(message.get("sender", "")),
+            action=str(message.get("action", "")),
+            payload=dict(message.get("payload", {})),
+            attestation=message.get("attestation"),
+            provenance=message.get("provenance"),
+        )
+
+    # -- queries ---------------------------------------------------------
+    def messages(self) -> list[dict[str, Any]]:
+        return [dict(m) for m in self._messages]
+
+    def what_did_agent_know(self, agent_id: str, t: datetime | str) -> dict[str, Any]:
+        """Replay the log up to timestamp ``t``; return the facts the
+        agent had received by then — the payload hashes (plus the
+        messages) where the agent was the sender or the ``told_by``
+        target — and the ``known_facts`` those messages record the
+        agent as having seen at mint time."""
+        as_of = _parse_time(t) if isinstance(t, str) else t
+        if as_of.tzinfo is None:
+            as_of = as_of.replace(tzinfo=timezone.utc)
+        facts: set[str] = set()
+        seen: list[dict[str, Any]] = []
+        for msg in self._messages:
+            ts = parse_hcs_timestamp(str(msg["consensus_timestamp"]))
+            if ts > as_of:
+                continue
+            told_by = (msg.get("provenance") or {}).get("told_by")
+            if msg.get("sender") == agent_id or told_by == agent_id:
+                seen.append(dict(msg))
+                facts.add(str(msg["payload_hash"]))
+                for fact in (msg.get("provenance") or {}).get("known_facts") or []:
+                    facts.add(str(fact))
+        return {
+            "agent_id": agent_id,
+            "as_of": format_hcs_timestamp(as_of),
+            "known_facts": sorted(facts),
+            "messages": seen,
+        }
+
+    def who_told_whom(
+        self,
+        agent_a: str,
+        agent_b: str,
+        t0: datetime | str | None = None,
+        t1: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        """All messages where A told B: B is the acting agent (sender)
+        and the message's provenance names A as ``told_by`` — A
+        supplied the information B's action relied on. In order, with
+        timestamps; optional [t0, t1] window (inclusive)."""
+        start = _parse_time(t0) if isinstance(t0, str) else t0
+        end = _parse_time(t1) if isinstance(t1, str) else t1
+        out: list[dict[str, Any]] = []
+        for msg in self._messages:
+            if msg.get("sender") != agent_b:
+                continue
+            if (msg.get("provenance") or {}).get("told_by") != agent_a:
+                continue
+            ts = parse_hcs_timestamp(str(msg["consensus_timestamp"]))
+            if start is not None and ts < start:
+                continue
+            if end is not None and ts > end:
+                continue
+            out.append(dict(msg))
+        return out
+
+    def verify_log(self) -> dict[str, Any]:
+        """Re-walk the log from disk (single source of truth)."""
+        return verify_log_file(self._path)
+
+
+def _default_runner(message_bytes, *, operator_account_id, topic_id, network):
+    """Submit via the Node helper (``@hashgraph/sdk``). The operator key
+    is read from the environment by the caller and reaches the helper
+    through its environment only — never argv, never logged."""
+    env = dict(os.environ)
+    env["JOULEX_HCS_OPERATOR"] = operator_account_id
+    try:
+        proc = subprocess.run(
+            ["node", _HCS_SUBMIT_SCRIPT, topic_id, network, message_bytes.decode("utf-8")],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env=env,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"RealHCS: could not run the Hedera submit helper: {exc}") from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "unknown error"
+        raise RuntimeError(f"RealHCS: Hedera submission failed: {detail}")
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError) as exc:
+        raise RuntimeError(
+            f"RealHCS: unparseable submit-helper output: {proc.stdout!r}"
+        ) from exc
+
+
+def load_hcs_config(data_dir: str) -> dict[str, Any]:
+    """Read ``<data_dir>/hcs_config.json``; missing or unreadable
+    config means local mode (never a silent live claim)."""
+    default = {"mode": "local", "hedera_topic": None, "network": "testnet"}
+    try:
+        with open(os.path.join(data_dir, "hcs_config.json"), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return dict(default)
+    if not isinstance(cfg, dict):
+        return dict(default)
+    out = dict(default)
+    for key in ("mode", "hedera_topic", "network"):
+        if cfg.get(key) is not None:
+            out[key] = cfg[key]
+    return out
+
+
+def make_hcs(data_dir: str, *, runner=None, now_fn=None) -> HCSClient:
+    """Factory: ``JOULEX_HCS_MODE=hedera`` plus a ``hedera`` config
+    returns a live ``RealHCS``; anything else returns ``LocalHCS``.
+    A hedera request without operator/topic fails closed — it never
+    silently falls back to local."""
+    cfg = load_hcs_config(data_dir)
+    if os.environ.get(_MODE_ENV) != "hedera" or cfg.get("mode") != "hedera":
+        return LocalHCS(data_dir, now_fn=now_fn)
+    operator = os.environ.get(_OPERATOR_ENV)
+    topic = cfg.get("hedera_topic")
+    if not operator or not topic:
+        raise RuntimeError(
+            "JOULEX_HCS_MODE=hedera but no operator/topic: set "
+            "JOULEX_HCS_OPERATOR and a real hedera_topic in "
+            "hcs_config.json (fail closed, never silently local)."
+        )
+    return RealHCS(
+        data_dir,
+        operator_account_id=operator,
+        topic_id=str(topic),
+        network=str(cfg.get("network") or "testnet"),
+        runner=runner,
+        now_fn=now_fn,
+    )
+
+
+class RealHCS(HCSClient):
+    """LIVE Hedera adapter (testnet first — see docs/HEDERA.md).
+
+    Writes locally FIRST through ``LocalHCS`` (same append-only log,
+    same hash chain — the local log is the fallback and replay source),
+    then submits the same message to the configured HCS topic via
+    ``joulex/hcs_submit.mjs`` (``@hashgraph/sdk``). The returned
+    message carries a ``hedera`` block: the receipt on success, or
+    ``{"status": "failed", "error": ...}`` on submission failure — a
+    failed submission never loses the local record and never blocks the
+    action from being audited locally.
+
+    The operator private key is NEVER stored: it is read from
+    ``JOULEX_HCS_PRIVATE_KEY`` at submit time and passed to the helper
+    through its environment only. Reads (messages / knowledge /
+    provenance / verify) come from the local log."""
+
+    def __init__(
+        self,
+        data_dir: str,
+        *,
+        operator_account_id: str,
+        topic_id: str,
+        network: str = "testnet",
+        runner=None,
+        key_env: str = _KEY_ENV,
+        now_fn=None,
+    ):
+        if not operator_account_id or not topic_id:
+            raise RuntimeError(
+                "RealHCS requires operator_account_id and topic_id (fail closed)."
+            )
+        if network not in _NETWORKS:
+            raise RuntimeError(
+                f"RealHCS: unsupported network {network!r} (expected testnet/mainnet)."
+            )
+        self.data_dir = data_dir
+        self.operator_account_id = str(operator_account_id)
+        self.topic_id = str(topic_id)
+        self.network = network
+        self._key_env = key_env
+        self._runner = runner or _default_runner
+        self._local = LocalHCS(data_dir, now_fn=now_fn)
+
+    def _submit_bytes(self, message_bytes: bytes) -> dict[str, Any]:
+        if not os.environ.get(self._key_env):
+            raise RuntimeError(
+                f"RealHCS: {self._key_env} is not set — refusing to submit "
+                "without a signing key."
+            )
+        return self._runner(
+            message_bytes,
+            operator_account_id=self.operator_account_id,
+            topic_id=self.topic_id,
+            network=self.network,
+        )
+
+    def append(
+        self,
+        *,
+        sender: str,
+        action: str,
+        payload: dict[str, Any],
+        attestation: dict[str, Any] | None = None,
+        provenance: dict[str, Any] | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        local = self._local.append(
+            sender=sender,
+            action=action,
+            payload=payload,
+            attestation=attestation,
+            provenance=provenance,
+            now=now,
+        )
+        try:
+            receipt = self._submit_bytes(canonical_bytes(local))
+            hedera: dict[str, Any] = {
+                "topic": self.topic_id,
+                "network": self.network,
+                **receipt,
+            }
+        except Exception as exc:  # noqa: BLE001 — the failure is data, not a crash
+            hedera = {
+                "topic": self.topic_id,
+                "network": self.network,
+                "status": "failed",
+                "error": str(exc),
+            }
+        return {**local, "hedera": hedera}
+
+    def submit(self, message: dict[str, Any]) -> dict[str, Any]:
+        receipt = self._submit_bytes(canonical_bytes(message))
+        return {
+            "message": dict(message),
+            "hedera": {"topic": self.topic_id, "network": self.network, **receipt},
+        }
+
+    def messages(self) -> list[dict[str, Any]]:
+        return self._local.messages()
+
+    def what_did_agent_know(self, agent_id: str, t: datetime | str) -> dict[str, Any]:
+        return self._local.what_did_agent_know(agent_id, t)
+
+    def who_told_whom(
+        self,
+        agent_a: str,
+        agent_b: str,
+        t0: datetime | str | None = None,
+        t1: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._local.who_told_whom(agent_a, agent_b, t0, t1)
+
+    def verify_log(self) -> dict[str, Any]:
+        return self._local.verify_log()

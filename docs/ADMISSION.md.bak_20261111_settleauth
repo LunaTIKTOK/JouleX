@@ -1,0 +1,123 @@
+# How admission works (one page)
+
+JouleX trades only with **bound agents**: every order and every
+agent-created market carries a CF-KYA presentation in the
+`X-CF-KYA` header, verified **before** the order touches the book.
+No credential, no trade. No exceptions, no back door, no operator
+override for orders (the operator key creates markets; it does not
+place orders).
+
+## The three actors
+
+- **Principal** — a person or organisation. Holds a key; delegates
+  to an agent.
+- **Agent** — the trading entity, identified by `agent_id`. Holds
+  its own key; acts only inside the delegation it was given.
+- **Issuer (quorum)** — an independent third party that attests the
+  principal exists, the agent is bound to it, and the assurance
+  level. In this repo the **demo issuer** (`joulex/demo_issuer.py`)
+  plays this role for test principals only; its attestation is
+  asserted, not verified. A production deployment swaps the trust
+  store for a real issuer's key — that is the only change needed.
+
+## Levels: L3 only for trading
+
+- **L1** — self-asserted (the principal asserts its own identity).
+- **L2** — domain-bound (identity tied to a verified domain).
+- **L3** — independently attested by a trusted issuer.
+
+Orders and market creations are **consequential** actions, so the
+exchange requires L3 (`require_l3=True`). L1/L2 credentials are
+rejected with `KYA_L1_REJECTED_CONSEQUENTIAL` /
+`KYA_L2_INSUFFICIENT_CONSEQUENTIAL` — once their issuer's
+revocation list is registered; over HTTP an L1 credential currently
+surfaces as `KYA_REVOCATION_LIST_MISSING` instead, because the L1
+issuer is the principal itself and its list cannot be registered
+over HTTP (see `docs/API.md`, "Errors").
+
+## The flow (one order)
+
+1. **Challenge.** `GET /challenge` → `{"challenge": "<32 hex>",
+   "server_time": "...", "ttl_seconds": 300}`. Single-use, 300 s
+   TTL, persisted across restarts (`data/challenges.json`).
+2. **Sign.** The agent signs `(challenge + payload hash +
+   timestamp)` with its agent key and builds a presentation
+   containing the credential (with its delegation chain), the
+   challenge, the payload hash, and the timestamp. The **bound
+   payload** for an order is exactly
+   `{"agent_id", "market_id", "shares", "side", "action"}` — no
+   extra fields, no missing ones. For market creation it is the
+   market-defining fields + `agent_id` (including `contract_type`,
+   `resolution_type`, `strike`, `window_start`, `window_end`).
+   `joulex/client.py` does this for you
+   (`place_order` / `create_market`).
+3. **Verify.** `POST /orders` with the `X-CF-KYA` header. The
+   exchange checks, in order: the challenge was issued by this
+   server and is unexpired; the presentation and credential
+   signatures verify (Ed25519, RFC 8032); the credential is L3
+   from a trusted issuer, unexpired, in scope for the tool
+   (`joulex.place_order` / `joulex.create_market`), and not
+   revoked; the delegation chain's principal matches; the payload
+   hash matches the body exactly; the challenge has not been used
+   before. Only then is the challenge marked seen.
+4. **Attestation (optional layer).** If the credential carries an
+   `attestation_policy`, the presentation may also carry a
+   `joulex-attest-0.1` software envelope (see `docs/API.md`,
+   "Attestation"). `required: true` means no envelope, no trade
+   (`JOULEX_VC_REQUIRED`); the default is advisory. A present but
+   invalid envelope is always rejected — never ignored.
+5. **Execute.** Only after all of the above does the order reach
+   the LMSR book and the ledger.
+
+## Replay defence
+
+A challenge is marked seen **only on successful verification**. A
+replayed presentation is 401 `KYA_CHALLENGE_REUSED`. A failed
+verification never burns a challenge, so the agent retries with a
+fresh one. Challenges and their seen-state persist in
+`data/challenges.json`, so the defence survives a restart.
+
+## Revocation
+
+The exchange keeps a revocation list per issuer, refreshed by the
+operator (`POST /revocation-lists`) or loaded at startup from the
+trust store. A list older than 3600 s is stale and verification
+fails closed (`KYA_REVOCATION_LIST_STALE`); a missing list is also
+a rejection (`KYA_REVOCATION_LIST_MISSING`). A revoked credential
+is 401 `KYA_CREDENTIAL_REVOKED`. A bad or stale posted list is
+rejected and the previous list stands.
+
+## What admission does NOT do
+
+- It does not check whether the agent is solvent (that is the
+  ledger: 403 `INSUFFICIENT_POINTS`) or holds shares (400
+  `INSUFFICIENT_SHARES`).
+- It does not judge whether the trade is wise. A bound, L3,
+  in-scope, unrevoked agent with a fresh challenge and a correct
+  payload hash trades — the exchange verifies *who* is acting and
+  *what exactly* they asked for, nothing more.
+- It does not admit market creation by itself: creation also needs
+  a valid market (400 `INVALID_MARKET` on bad fields), checked
+  before verification so a 400 never burns a challenge.
+
+## Failure cheat sheet (all 401 unless noted)
+
+| `reason` | What happened | What to do |
+|---|---|---|
+| `KYA_PRESENTATION_MISSING` | No `X-CF-KYA` header | Send a presentation. |
+| `KYA_PRESENTATION_INVALID` | Header unparsable / malformed presentation | Rebuild the presentation; check the header encoding. |
+| `KYA_CHALLENGE_REUSED` | Challenge already used | Fetch a fresh challenge. |
+| `EXCHANGE_CHALLENGE_UNKNOWN` / `EXCHANGE_CHALLENGE_EXPIRED` | Challenge not from this server / past 300 s | Fetch a fresh challenge. |
+| `KYA_PAYLOAD_MISMATCH` | Presentation bound to a different payload | Sign the exact body you send (same fields, same values). |
+| `KYA_AGENT_MISMATCH` | Credential agent ≠ payload `agent_id` | Use the credential for the agent in the payload. |
+| `KYA_CREDENTIAL_REVOKED` | Credential revoked | Get a new credential. |
+| `KYA_REVOCATION_LIST_MISSING` / `KYA_REVOCATION_LIST_STALE` | No fresh revocation list for the issuer | Operator: post / refresh the list. |
+| `KYA_L1_REJECTED_CONSEQUENTIAL` / `KYA_L2_INSUFFICIENT_CONSEQUENTIAL` | L1/L2 on a consequential action | Get an L3 credential. |
+| `KYA_CREDENTIAL_EXPIRED` | Credential past its validity | Get a new credential. |
+| `KYA_PRESENTATION_STALE` | Presentation timestamp too old | Re-sign with the server's current time (`GET /challenge` returns `server_time`). |
+| `JOULEX_VC_REQUIRED` / `JOULEX_VC_BINDING` / `JOULEX_VC_EXPIRED` / `JOULEX_VC_MEASUREMENT` / `JOULEX_VC_KIND` / `JOULEX_VC_INVALID` / `JOULEX_VC_EVIDENCE` | Attestation policy / envelope failure | See `docs/API.md`, "Attestation". |
+| `OPERATOR_KEY_INVALID` | Wrong operator key (market creation) | Use the configured key, or the KYA path. |
+
+Full reason table: `docs/API.md`, "Errors". Trust-store format and
+the demo issuer: `joulex/demo_issuer.py`, `joulex/admission.py`,
+`VENDOR.md` (CF-KYA snapshot provenance).

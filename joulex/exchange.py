@@ -1,0 +1,1337 @@
+"""Exchange: the service core — state + rules, no HTTP.
+
+Owns markets, the ledger, and the admission verifier. Every mutation
+saves state to disk. Raises ``ExchangeError`` (with an HTTP status and
+a reason string) on any refusal; callers map that to the API response.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import sys
+import threading
+from datetime import datetime, timezone
+from typing import Any
+
+from . import __version__
+from .accounts import AccountStore, public_view
+from .admission import (
+    ExchangeVerifier,
+    creation_payload,
+    creation_payload_hash,
+    order_payload,
+    payload_hash,
+)
+from .errors import ExchangeError
+from .attestation import (
+    canonical_bytes,
+    load_pinned_measurements,
+    payload_hash_for_settlement,
+    verify_envelope,
+)
+from .challenges import PersistentChallengeStore
+from .decision_basis import capture_decision_basis
+from .hcs import MAX_MESSAGE_BYTES, LocalHCS, RealHCS, make_hcs, parse_hcs_timestamp
+from .ledger import STARTING_POINTS, Ledger
+from .lmsr import apply_trade_multi, prices_multi, trade_cost_multi
+from .markets import (
+    BINARY_OUTCOMES,
+    can_settle,
+    can_trade,
+    market_outcomes,
+    market_q,
+    new_market,
+    parse_time,
+    resolve_outcome,
+)
+from .aeso import AESOUnavailable
+from .settlement import PaperSettlementHook, SettlementHook
+from .settlement_receipts import (
+    append_receipt,
+    receipt_for_settlement,
+)
+from .store import JsonStore
+
+# Fail-closed settlement anchor policy: "fail_closed" (default —
+# a RealHCS settlement pays out only once its anchor lands) or
+# "fail_retain" (finalize inline, anchor queued behind). Env
+# JOULEX_SETTLE_ANCHOR_POLICY, when set, wins over the constructor
+# kwarg; any other value raises ValueError at construction.
+SETTLE_ANCHOR_POLICIES = ("fail_closed", "fail_retain")
+PENDING_SETTLEMENTS_FILENAME = "settlements_pending.jsonl"
+
+
+class Exchange:
+    def __init__(
+        self,
+        *,
+        data_dir: str,
+        now_fn=None,
+        trusted_issuers: dict[str, str] | None = None,
+        domain_keys: dict[str, str] | None = None,
+        settlement_hook: SettlementHook | None = None,
+        settlement_oracle=None,
+        operator_key: str | None = None,
+        settle_anchor_policy: str = "fail_closed",
+    ):
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        self.store = JsonStore(data_dir)
+        # M1.4: human accounts. Corrupt account state refuses startup
+        # (fail closed), like the market/ledger load below.
+        self.accounts = AccountStore(self.store, now_fn=self._now_fn)
+        self.settlement_oracle = settlement_oracle
+        # M4 chunk 2: settlement anchor policy. The env var, when
+        # set, wins over the kwarg; anything else is a fail-closed
+        # construction error, never a silent default.
+        policy = os.environ.get("JOULEX_SETTLE_ANCHOR_POLICY")
+        if policy is None:
+            policy = settle_anchor_policy
+        if policy not in SETTLE_ANCHOR_POLICIES:
+            raise ValueError(
+                "settle_anchor_policy must be one of "
+                f"{SETTLE_ANCHOR_POLICIES}, got {policy!r}"
+            )
+        self.settle_anchor_policy = policy
+        # The lock and the pending-settlement table exist BEFORE the
+        # HCS client is built: make_hcs takes on_anchor, and the
+        # anchor worker thread may call back into the exchange.
+        self._lock = threading.RLock()
+        self._pending_settlements: dict[str, dict[str, Any]] = {}
+        # M1: the HCS-schema audit log. LocalHCS refuses startup on a
+        # corrupt log (fail closed) — a broken audit trail never
+        # trades. The log header records {"mode": "local",
+        # "hedera_topic": null}: a LOCAL simulation, never called a
+        # Hedera consensus timestamp (DESIGN.md §7.3). When
+        # JOULEX_HCS_MODE=hedera and data/hcs_config.json names a real
+        # topic, make_hcs returns a live RealHCS instead: every action
+        # is still written locally first, then submitted to the topic
+        # (docs/HEDERA.md). Without the mode flag the log stays local.
+        self.hcs = make_hcs(
+            data_dir, now_fn=self._now_fn, on_anchor=self._handle_anchor
+        )
+        # Operator key for market creation (M2) and settlement
+        # (2026-11-11): a human-held secret supplied at startup
+        # (env/flag, never in code or state files). None means the
+        # operator-key path is closed entirely.
+        self.operator_key = operator_key
+        self.verifier = ExchangeVerifier(
+            trusted_issuers=trusted_issuers or {},
+            domain_keys=domain_keys,
+            now_fn=self._now_fn,
+            # M3: issued + seen challenges persist in data/challenges.json,
+            # so the replay defence survives a restart.
+            challenge_store=PersistentChallengeStore(
+                self.store, now_fn=self._now_fn
+            ),
+            # M1: verifier-level pinned measurements (operator-maintained
+            # data/measurements.json) + provenance dir for link-backed
+            # evidence.
+            pinned_measurements=load_pinned_measurements(data_dir),
+            provenance_dir=os.path.join(data_dir, "provenance"),
+        )
+        self.settlement_hook = settlement_hook or PaperSettlementHook(self.store)
+        # Commercial observability (audit 2026-11-12): process-start
+        # counters for /metrics. In-memory only — the durable record
+        # is the HCS log + trades/settlements logs.
+        self._started_at = datetime.now(timezone.utc)
+        self._counters = {"orders": 0, "markets_created": 0, "settlements": 0}
+        self._load()
+        self._load_pending()
+
+    # -- pending settlements (M4 chunk 2) ------------------------------
+    def _load_pending(self) -> None:
+        """Reload fail-closed settlements that were awaiting their
+        anchor when the process stopped. A corrupt line refuses
+        startup — a pending payout must never be silently forgotten."""
+        try:
+            records = self.store.read_jsonl(PENDING_SETTLEMENTS_FILENAME)
+        except (ValueError, OSError) as exc:
+            raise RuntimeError(
+                f"refusing to start: unreadable pending settlements: {exc}"
+            ) from exc
+        for record in records:
+            if isinstance(record, dict) and record.get("settlement_id"):
+                self._pending_settlements[str(record["settlement_id"])] = record
+
+    def _save_pending(self) -> None:
+        """Rewrite settlements_pending.jsonl atomically (temp +
+        fsync + os.replace) from the in-memory pending table. The
+        file is append-only in the store, but superseding a failed
+        attempt needs a rewrite — this is the single writer."""
+        path = os.path.join(self.store.data_dir, PENDING_SETTLEMENTS_FILENAME)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for record in self._pending_settlements.values():
+                f.write(json.dumps(record, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def pending_settlements(self) -> list[dict[str, Any]]:
+        """Pending (fail-closed) settlements, for observability."""
+        return [dict(p) for p in self._pending_settlements.values()]
+
+    def settlement_receipt(self, settlement_id: str) -> dict[str, Any] | None:
+        """The settlement-receipt sidecar for one settlement id."""
+        return receipt_for_settlement(self.store.data_dir, settlement_id)
+
+    # -- clock ---------------------------------------------------------
+    def now(self) -> datetime:
+        return self._now_fn()
+
+    # -- persistence ---------------------------------------------------
+    def _load(self) -> None:
+        try:
+            markets = self.store.load_json("markets.json", {})
+            ledger_state = self.store.load_json("ledger.json", {})
+        except (ValueError, OSError) as exc:
+            # Refuse to trade on partial/corrupt state.
+            raise RuntimeError(f"refusing to start: unreadable state: {exc}") from exc
+        if not isinstance(markets, dict) or not isinstance(ledger_state, dict):
+            raise RuntimeError("refusing to start: corrupt state (not objects)")
+        # M6: records written before multi-outcome markets carry no
+        # outcomes/q/prices fields. They are binary — rebuild the
+        # generalized shape from the legacy mirrors so the rest of the
+        # code can assume every market has them.
+        for market in markets.values():
+            if not isinstance(market, dict):
+                raise RuntimeError("refusing to start: corrupt state (market not an object)")
+            if "outcomes" not in market:
+                market["outcomes"] = list(BINARY_OUTCOMES)
+                market["q"] = [
+                    float(market.get("q_yes", 0.0)),
+                    float(market.get("q_no", 0.0)),
+                ]
+                py = float(market.get("price_yes", 0.5))
+                market["prices"] = {"YES": py, "NO": 1.0 - py}
+        self.markets: dict[str, dict[str, Any]] = markets
+        self.ledger = Ledger(ledger_state)
+
+    def save(self) -> None:
+        self.store.save_json("markets.json", self.markets)
+        self.store.save_json("ledger.json", self.ledger.to_dict())
+
+    # -- M1 audit log --------------------------------------------------
+    def _hcs_append(self, *, sender: str, action: str, payload: dict[str, Any],
+                    attestation: dict[str, Any] | None = None,
+                    provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Append one action to the HCS-schema audit log. A log failure
+        on the success path is a 503 BEFORE any state changes — the
+        audit trail is load-bearing, so an action that cannot be
+        recorded does not execute."""
+        try:
+            return self.hcs.append(
+                sender=sender, action=action, payload=payload,
+                attestation=attestation, provenance=provenance, now=self.now(),
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ExchangeError(503, f"HCS_LOG_FAILURE: {exc}") from exc
+
+    def _log_attestation_result(
+        self, *, agent_id: str, action: str, reason: str, envelope: Any
+    ) -> None:
+        """Best-effort record of an attestation verification result on
+        the rejection path (DESIGN.md §7.3: attestation verification
+        results are logged actions). Never masks the original refusal:
+        a log failure here is swallowed."""
+        try:
+            self.hcs.append(
+                sender=agent_id,
+                action="attestation_verification",
+                payload={
+                    "action": action,
+                    "result": "rejected",
+                    "reason": reason,
+                    "had_envelope": envelope is not None,
+                },
+                attestation=envelope if isinstance(envelope, dict) else None,
+                provenance={"told_by": "exchange", "known_facts": []},
+                now=self.now(),
+            )
+        except (OSError, ValueError, RuntimeError):
+            pass
+
+    # -- markets -------------------------------------------------------
+    def create_market(
+        self,
+        presentation: dict[str, Any] | None = None,
+        *,
+        operator_key: str | None = None,
+        **fields: Any,
+    ) -> dict[str, Any]:
+        """Create a market, admitted (M2). Two auth paths, fail closed:
+
+        - ``X-Operator-Key`` present: it is authoritative. It must
+          match the key configured at startup (constant-time compare);
+          a wrong key — or any key when none is configured — is 401
+          ``OPERATOR_KEY_INVALID`` with no KYA fallback. A match
+          creates the market as ``created_by="operator"``.
+        - Otherwise CF-KYA, same admission as orders: the body must
+          carry ``agent_id`` (400 if missing) and the presentation must
+          verify L3 against the creation payload (401 on any failure).
+          The creator's ``agent_id`` is recorded on the market.
+
+        Ordering: the operator-key check runs first (before any
+        validation), then a missing presentation is 401, then market
+        validation (400), then KYA verification (401). A 400 therefore
+        never burns a challenge, and a 401 never creates a market. No
+        state changes on refusal.
+        """
+        with self._lock:
+            # 1. Operator-key path — authoritative when the header is
+            # present; checked before validation or any KYA work.
+            created_by: str | None = None
+            if operator_key is not None:
+                if (
+                    self.operator_key is None
+                    or not hmac.compare_digest(str(operator_key), self.operator_key)
+                ):
+                    raise ExchangeError(401, "OPERATOR_KEY_INVALID")
+                created_by = "operator"
+                fields.pop("agent_id", None)
+            else:
+                # No presentation at all is 401 before any field
+                # complaint: an unauthenticated caller gets the auth
+                # error, not validation detail.
+                if presentation is None:
+                    raise ExchangeError(401, "KYA_PRESENTATION_MISSING")
+                agent_id = fields.pop("agent_id", None)
+                if agent_id is None:
+                    raise ExchangeError(400, "INVALID_MARKET: agent_id required")
+                created_by = str(agent_id)
+            # 2. Market validation — before verification, so a 400
+            # never consumes a challenge.
+            try:
+                market = new_market(now=self.now(), **fields)
+            except (ValueError, TypeError) as exc:
+                raise ExchangeError(400, f"INVALID_MARKET: {exc}") from exc
+            # 3. KYA admission (skipped on the operator path).
+            envelope: dict[str, Any] | None = None
+            if operator_key is None:
+                try:
+                    bound = creation_payload(agent_id=created_by, **fields)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ExchangeError(400, f"INVALID_MARKET: {exc}") from exc
+                ok, reason, _info = self.verifier.verify_creation(
+                    presentation, bound, agent_id=created_by
+                )
+                if not ok:
+                    if reason.startswith("JOULEX_VC_"):
+                        envelope = (
+                            presentation.get("attestation")
+                            if isinstance(presentation, dict)
+                            else None
+                        )
+                        self._log_attestation_result(
+                            agent_id=created_by, action="create_market",
+                            reason=reason, envelope=envelope,
+                        )
+                    raise ExchangeError(401, reason)
+                envelope = (
+                    presentation.get("attestation")
+                    if isinstance(presentation, dict)
+                    else None
+                )
+            market["created_by"] = created_by
+            # M1: the envelope rides on the market record, and the
+            # creation is one ordered message in the HCS audit log —
+            # appended BEFORE the market is stored, so a log failure
+            # (503) creates nothing.
+            market["attestation"] = envelope
+            try:
+                creation_bound = creation_payload(agent_id=created_by, **fields)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ExchangeError(400, f"INVALID_MARKET: {exc}") from exc
+            self._hcs_append(
+                sender=created_by,
+                action="create_market",
+                payload=creation_bound,
+                attestation=envelope,
+                provenance={
+                    "told_by": "operator" if operator_key is not None else "exchange",
+                    "known_facts": (
+                        [creation_payload_hash(creation_bound)]
+                        if operator_key is None
+                        else []
+                    ),
+                },
+            )
+            self.markets[market["market_id"]] = market
+            self.save()
+            self._counters["markets_created"] += 1
+            return dict(market)
+
+    def list_markets(self) -> list[dict[str, Any]]:
+        return [dict(m) for m in self.markets.values()]
+
+    def get_market(self, market_id: str) -> dict[str, Any]:
+        market = self.markets.get(market_id)
+        if market is None:
+            raise ExchangeError(404, "MARKET_NOT_FOUND")
+        return dict(market)
+
+    # -- admission -----------------------------------------------------
+    def issue_challenge(self) -> dict[str, Any]:
+        return {
+            "challenge": self.verifier.issue_challenge(),
+            "server_time": self.now().isoformat(),
+            "ttl_seconds": 300,
+        }
+
+    def refresh_revocation_list(self, revocation_list: dict[str, Any], **kwargs) -> tuple[bool, str]:
+        return self.verifier.refresh_revocation_list(revocation_list, **kwargs)
+
+    # -- orders --------------------------------------------------------
+    def place_order(
+        self, presentation: dict[str, Any] | None, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        with self._lock:
+            now = self.now()
+            # 1. Payload shape — before any crypto runs.
+            try:
+                agent_id = str(payload["agent_id"])
+                market_id = str(payload["market_id"])
+                side = str(payload["side"])
+                shares = float(payload["shares"])
+                action = str(payload.get("action", "buy"))
+            except (KeyError, TypeError, ValueError):
+                raise ExchangeError(400, "INVALID_ORDER: agent_id, market_id, side, shares required") from None
+            if action not in ("buy", "sell"):
+                raise ExchangeError(400, "INVALID_ORDER: action must be buy or sell")
+            if shares <= 0:
+                raise ExchangeError(400, "INVALID_ORDER: shares must be > 0")
+            bound = order_payload(
+                agent_id=agent_id, market_id=market_id, side=side, shares=shares, action=action
+            )
+            market = self.markets.get(market_id)
+            if market is None:
+                raise ExchangeError(404, "MARKET_NOT_FOUND")
+            # The side must be one of this market's outcomes (YES/NO on
+            # a binary market, any label on a multi-outcome market).
+            outcomes = market_outcomes(market)
+            if side not in outcomes:
+                raise ExchangeError(400, "INVALID_ORDER: side must be one of the market outcomes")
+            # 2. Market open?
+            ok, reason = can_trade(market, now)
+            if not ok:
+                raise ExchangeError(409, reason)
+            # 3. Admission — CF-KYA, L3 only. No credential, no trade.
+            # M1: the attestation envelope (if any) rides on the
+            # presentation and is verified inside the verifier (policy
+            # step); a JOULEX_VC_* refusal is itself logged.
+            ok, reason, info = self.verifier.verify_order(presentation, bound, agent_id=agent_id)
+            if not ok:
+                if reason.startswith("JOULEX_VC_"):
+                    envelope = (
+                        presentation.get("attestation")
+                        if isinstance(presentation, dict)
+                        else None
+                    )
+                    self._log_attestation_result(
+                        agent_id=agent_id, action="place_order",
+                        reason=reason, envelope=envelope,
+                    )
+                raise ExchangeError(401, reason)
+            envelope = (
+                presentation.get("attestation")
+                if isinstance(presentation, dict)
+                else None
+            )
+            # 4. Position check for sells (before any state change).
+            signed_shares = shares if action == "buy" else -shares
+            if action == "sell" and self.ledger.position(agent_id, market_id, side) < shares - 1e-9:
+                raise ExchangeError(400, "INSUFFICIENT_SHARES")
+            # 5. LMSR cost + balance check (before any state change).
+            # A brand-new agent's effective balance is the 1,000-point
+            # endowment; the account is only created at execution, so a
+            # rejected order leaves no trace at all.
+            # Generalized LMSR (M6): the binary market is the N=2 case
+            # of the same function — one code path for every market.
+            index = outcomes.index(side)
+            q = market_q(market)
+            cost = trade_cost_multi(q, market["b"], index, signed_shares)
+            effective_balance = (
+                self.ledger.balance(agent_id)
+                if agent_id in self.ledger.agents
+                else STARTING_POINTS
+            )
+            if cost > 0 and cost > effective_balance + 1e-9:
+                raise ExchangeError(403, "INSUFFICIENT_POINTS")
+            # M1: the order is one ordered message in the HCS audit
+            # log — appended AFTER every check that can refuse it and
+            # BEFORE execution, so a log failure (503) executes
+            # nothing and a refused order leaves no action record.
+            self._hcs_append(
+                sender=agent_id,
+                action="place_order",
+                payload=bound,
+                attestation=envelope,
+                provenance={
+                    "told_by": "exchange",
+                    "known_facts": [payload_hash(bound)],
+                },
+            )
+            # 6. Execute.
+            new_q = apply_trade_multi(q, index, signed_shares)
+            prices_after = dict(zip(outcomes, prices_multi(new_q, market["b"])))
+            market["q"] = new_q
+            market["prices"] = prices_after
+            if outcomes == BINARY_OUTCOMES:
+                market["q_yes"], market["q_no"] = new_q
+                market["price_yes"] = prices_after["YES"]
+            self.ledger.apply_trade(
+                agent_id=agent_id, market_id=market_id, side=side,
+                shares=signed_shares, cost=cost,
+            )
+            receipt = {
+                "trade_id": "trd_" + secrets.token_hex(6),
+                "timestamp": now.isoformat(),
+                "market_id": market_id,
+                "agent_id": agent_id,
+                "principal_id": info.get("principal_id"),
+                "credential_id": info.get("credential_id"),
+                "side": side,
+                "action": action,
+                "shares": shares,
+                "cost_points": cost,
+                "prices_after": prices_after,
+                "balance_after": self.ledger.balance(agent_id),
+                "payload_hash": payload_hash(bound),
+                # M1: the attestation envelope (if any) rides on the
+                # receipt, with its verification status.
+                "attestation": envelope,
+                "attestation_status": "verified" if envelope is not None else "absent",
+            }
+            if outcomes == BINARY_OUTCOMES:
+                # Legacy field, kept so existing clients, the demo,
+                # and the reconciler's binary path keep working.
+                receipt["price_yes_after"] = prices_after["YES"]
+            self.store.append_jsonl("trades.jsonl", receipt)
+            self.save()
+            self._counters["orders"] += 1
+            return receipt
+
+    # -- positions / ledger views --------------------------------------
+    def positions(self, agent_id: str) -> dict[str, Any]:
+        return {
+            "agent_id": agent_id,
+            "balance_points": self.ledger.balance(agent_id),
+            "positions": self.ledger.positions_for(agent_id),
+        }
+
+    # -- accounts (M1.4) ----------------------------------------------
+    # Registration, agent links and disables are HCS audit events:
+    # validated, appended, then committed — a log failure (503)
+    # executes nothing, like orders. Login/logout/session reads are
+    # not log events (session noise, no money moves). The Exchange
+    # mints the account id so the audit event can name it before the
+    # account exists.
+    def register_account(
+        self, email: Any = None, password: Any = None, display_name: Any = None, role: Any = None
+    ) -> dict[str, Any]:
+        with self._lock:
+            email, display_name, role = self.accounts.validate_registration(
+                email, password, display_name, role
+            )
+            account_id = "acct_" + secrets.token_hex(8)
+            self._hcs_append(
+                sender=account_id,
+                action="account_register",
+                payload={"account_id": account_id, "email": email, "role": role},
+                provenance={"told_by": "exchange", "known_facts": []},
+            )
+            record = self.accounts.create_account(
+                email, password, display_name, role, account_id=account_id
+            )
+            return public_view(record)
+
+    def login_account(self, email: Any, password: Any) -> dict[str, Any]:
+        with self._lock:
+            return self.accounts.login(email, password)
+
+    def logout_account(self, token: Any) -> dict[str, Any]:
+        with self._lock:
+            return self.accounts.logout(token)
+
+    def account_for_token(self, token: Any) -> dict[str, Any]:
+        return self.accounts.authenticate(token)
+
+    def link_agent_to_account(
+        self,
+        account_id: Any,
+        presentation: dict[str, Any] | None,
+        *,
+        agent_id: str,
+    ) -> dict[str, Any]:
+        """Bind a CF-KYA L3 agent to a human account. The presentation
+        must be a fresh challenge-bound signature over the link
+        payload — proof the agent key holder consents. The credential
+        must cover joulex.place_order (the linked agent has to be
+        able to trade)."""
+        with self._lock:
+            if (
+                not isinstance(account_id, str)
+                or not account_id
+                or not isinstance(agent_id, str)
+                or not agent_id
+            ):
+                raise ExchangeError(400, "ACCOUNT_VALIDATION: account_id and agent_id required")
+            ok, reason, info = self.verifier.verify_link(
+                presentation, account_id=account_id, agent_id=agent_id
+            )
+            if not ok:
+                raise ExchangeError(401, reason)
+            credential_id = str(info.get("credential_id", ""))
+            self.accounts.check_linkable(account_id, credential_id)
+            self._hcs_append(
+                sender=account_id,
+                action="account_link_agent",
+                payload={
+                    "account_id": account_id,
+                    "agent_id": agent_id,
+                    "credential_id": credential_id,
+                    "principal_id": info.get("principal_id"),
+                },
+                provenance={"told_by": "exchange", "known_facts": []},
+            )
+            record = self.accounts.add_linked_agent(
+                account_id,
+                {
+                    "credential_id": credential_id,
+                    "agent_id": agent_id,
+                    "principal_id": info.get("principal_id"),
+                    "linked_at": self.now().isoformat(),
+                },
+            )
+            return public_view(record)
+
+    def disable_account(
+        self, account_id: Any, *, by_account: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Admin-only: disable an account and revoke its sessions.
+        One-way in this version (no enable endpoint)."""
+        with self._lock:
+            if not isinstance(by_account, dict) or by_account.get("role") != "admin":
+                raise ExchangeError(403, "ACCOUNT_FORBIDDEN")
+            if not isinstance(account_id, str):
+                raise ExchangeError(400, "ACCOUNT_VALIDATION: account_id required")
+            if self.accounts.get_account(account_id) is None:
+                raise ExchangeError(404, "ACCOUNT_NOT_FOUND")
+            self._hcs_append(
+                sender=str(by_account.get("account_id", "exchange")),
+                action="account_disable",
+                payload={
+                    "account_id": account_id,
+                    "disabled_by": by_account.get("account_id"),
+                },
+                provenance={"told_by": "exchange", "known_facts": []},
+            )
+            record = self.accounts.disable(account_id)
+            return public_view(record)
+
+    def ledger_view(self) -> dict[str, Any]:
+        return {
+            "balances": dict(self.ledger.balances),
+            "pool": self.ledger.pool,
+            "conservation": self.ledger.conservation(),
+        }
+
+    # -- reconciliation (M5) -------------------------------------------
+    def reconcile(self) -> dict[str, Any]:
+        """Re-derive money state from the append-only logs and compare
+        with the stored ledger/markets. See joulex/reconcile.py.
+        Read-only: never mutates state."""
+        from .reconcile import reconcile as _reconcile
+
+        return _reconcile(self.store.data_dir)
+
+    # -- M3 audit-log / attestation views (read-only) ---------------
+    # DESIGN.md §10 rows the M0/M1 server never exposed. All views
+    # read the append-only HCS log (joulex/hcs.py); nothing here
+    # writes, edits, or deletes a log message.
+    def list_attestations(
+        self, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """Attestation envelopes carried on log messages, latest
+        first. Only actions that carried an envelope appear (an
+        unattested order leaves no entry)."""
+        entries = [
+            {
+                "sequence": m["sequence"],
+                "consensus_timestamp": m["consensus_timestamp"],
+                "sender": m["sender"],
+                "action": m["action"],
+                "attestation": m["attestation"],
+            }
+            for m in self.hcs.messages()
+            if m.get("attestation") is not None
+        ]
+        total = len(entries)
+        entries.reverse()
+        return {
+            "attestations": entries[offset:offset + limit],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def hcs_log(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        agent_id: str | None = None,
+        from_ts=None,
+        to_ts=None,
+    ) -> dict[str, Any]:
+        """HCS audit-log messages, latest first. ``agent_id`` filters
+        to messages the agent sent; ``from_ts``/``to_ts`` bound the
+        consensus timestamps (inclusive)."""
+        msgs = self.hcs.messages()
+        if agent_id is not None:
+            msgs = [m for m in msgs if m.get("sender") == agent_id]
+        if from_ts is not None:
+            msgs = [
+                m for m in msgs
+                if parse_hcs_timestamp(str(m["consensus_timestamp"])) >= from_ts
+            ]
+        if to_ts is not None:
+            msgs = [
+                m for m in msgs
+                if parse_hcs_timestamp(str(m["consensus_timestamp"])) <= to_ts
+            ]
+        total = len(msgs)
+        msgs = list(reversed(msgs))
+        return {
+            "messages": msgs[offset:offset + limit],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def hcs_verify(self) -> dict[str, Any]:
+        """Re-walk the log from disk: sequence, hash chain, timestamp
+        monotonicity. See joulex/hcs.py verify_log_file."""
+        return self.hcs.verify_log()
+
+    # -- M4 auditability (third-party settlement verification) -----
+    # Thin wrappers over joulex/audit.py (imported lazily to avoid an
+    # import cycle: audit reads the data files, never the Exchange).
+    def audit_settlement(self, settlement_id: str) -> dict[str, Any]:
+        """Full third-party verification of one settlement id — see
+        joulex/audit.py verify_settlement."""
+        from .audit import verify_settlement
+
+        return verify_settlement(settlement_id, self.store.data_dir)
+
+    def checkpoint_audit_log(self) -> dict[str, Any]:
+        """Append one log-checkpoint message; see joulex/audit.py."""
+        from .audit import checkpoint_log
+
+        return checkpoint_log(self.store.data_dir, self.hcs)
+
+    def hcs_knowledge(self, agent_id: str, at: Any) -> dict[str, Any]:
+        """What agent ``agent_id`` knew at time ``at`` (log replay).
+        Raises ValueError on an unparseable timestamp."""
+        return self.hcs.what_did_agent_know(agent_id, at)
+
+    def hcs_provenance(
+        self,
+        from_agent: str,
+        to_agent: str,
+        t0: Any = None,
+        t1: Any = None,
+    ) -> list[dict[str, Any]]:
+        """Messages where ``from_agent`` told ``to_agent``, in order,
+        optionally inside [t0, t1]."""
+        return self.hcs.who_told_whom(from_agent, to_agent, t0, t1)
+
+    # -- settlement ----------------------------------------------------
+    def settle_market(
+        self,
+        market_id: str,
+        *,
+        observed_value: float | None = None,
+        outcome: str | None = None,
+        evidence: str | None = None,
+        oracle=None,
+        attestation: dict[str, Any] | None = None,
+        attestation_binding: dict[str, Any] | None = None,
+        operator_key: str | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            now = self.now()
+            # Settlement authentication (2026-11-11 — this path
+            # previously had NO credential/policy at all: any caller
+            # could settle any market). Operator key, mirroring
+            # create_market's semantics exactly: a presented key is
+            # authoritative and must match the key configured at
+            # startup (constant-time compare); a wrong key — or any
+            # key when none is configured — is 401
+            # OPERATOR_KEY_INVALID. Unlike creation there is no KYA
+            # fallback on this path (settlement is an operator
+            # action), so when a key IS configured a missing key is
+            # also 401 — fail closed. When no key is configured and
+            # none is presented the key gate is open and the per-type
+            # rules below decide (public_source still requires a valid
+            # attestation). The check runs before any market lookup
+            # or oracle fetch: an unauthenticated caller gets the
+            # auth error, and a refusal changes no state.
+            if operator_key is not None:
+                if (
+                    self.operator_key is None
+                    or not hmac.compare_digest(str(operator_key), self.operator_key)
+                ):
+                    raise ExchangeError(401, "OPERATOR_KEY_INVALID")
+            elif self.operator_key is not None:
+                raise ExchangeError(401, "OPERATOR_KEY_INVALID")
+            market = self.markets.get(market_id)
+            if market is None:
+                raise ExchangeError(404, "MARKET_NOT_FOUND")
+            # M4 chunk 2 — idempotent re-settle: a market awaiting
+            # its anchor returns the stored pending record at once
+            # (same settlement_id, no new HCS message, no new anchor
+            # job). A record whose anchor died falls through to a
+            # FRESH attempt below (new settlement_id, superseding
+            # the old record) — the can_settle status check is
+            # bypassed for that case only, since the market is
+            # SETTLEMENT_PENDING by design until an anchor lands.
+            pending_for_market = next(
+                (
+                    p for p in self._pending_settlements.values()
+                    if p.get("market_id") == market_id
+                ),
+                None,
+            )
+            if pending_for_market is not None:
+                if pending_for_market.get("status") == "PENDING_ANCHOR":
+                    return dict(pending_for_market)
+                if pending_for_market.get("status") != "ANCHOR_FAILED":
+                    raise ExchangeError(409, f"MARKET_{market['status']}")
+            if pending_for_market is not None and pending_for_market.get(
+                "status"
+            ) == "ANCHOR_FAILED":
+                if now < parse_time(market["resolves_at"]):
+                    raise ExchangeError(409, "MARKET_NOT_YET_RESOLVABLE")
+            else:
+                ok, reason = can_settle(market, now)
+                if not ok:
+                    raise ExchangeError(409, reason)
+            # Oracle path (M0): when an oracle is configured, an
+            # aeso_price market settles from the fetched pool-price
+            # series. The fetched max wins; an operator-supplied value
+            # is ignored. Oracle failure refuses settlement (503) and
+            # the market stays OPEN — no outcome is ever guessed.
+            effective_oracle = oracle if oracle is not None else self.settlement_oracle
+            oracle_source_url = None
+            if market["resolution_type"] == "aeso_price" and effective_oracle is not None:
+                try:
+                    outcome, observed_value, oracle_source_url = effective_oracle.resolve_market(market)
+                except AESOUnavailable as exc:
+                    raise ExchangeError(503, f"{exc.code}: {exc.detail}") from exc
+                evidence = oracle_source_url
+            try:
+                resolved = resolve_outcome(
+                    market, observed_value=observed_value, outcome=outcome
+                )
+            except ValueError as exc:
+                raise ExchangeError(400, f"INVALID_SETTLEMENT: {exc}") from exc
+            if market["resolution_type"] == "public_source" and not evidence:
+                raise ExchangeError(400, "INVALID_SETTLEMENT: public_source settlement requires evidence")
+            # Settlement attestation (DESIGN.md §7; policy tightened
+            # 2026-11-11). For public_source markets the envelope is
+            # MANDATORY: the settler asserts an off-exchange fact, so
+            # an absent envelope is 401 JOULEX_VC_REQUIRED and the
+            # market stays OPEN — regardless of the operator key. For
+            # aeso_price markets the envelope stays advisory (absent
+            # means plain settlement): the outcome there derives from
+            # the fetched oracle series or the operator-key-gated
+            # observed value, never from an unattested assertion. A
+            # PRESENT envelope is always verified, on every type:
+            # present+valid is recorded on the receipt; present+
+            # invalid is rejected (401) and the market stays OPEN.
+            # The envelope binds the settlement payload hash; the
+            # settler supplies credential_id + challenge_nonce
+            # alongside it (the same normative binding rule as
+            # orders, DESIGN.md §7.1).
+            attestation_status = "absent"
+            settlement_hash = payload_hash_for_settlement(
+                market_id=market_id, outcome=resolved,
+                observed_value=observed_value, evidence=evidence,
+            )
+            if attestation is None and market["resolution_type"] == "public_source":
+                self._log_attestation_result(
+                    agent_id="exchange", action="settle_market",
+                    reason="JOULEX_VC_REQUIRED", envelope=None,
+                )
+                raise ExchangeError(401, "JOULEX_VC_REQUIRED")
+            if attestation is not None:
+                if not isinstance(attestation_binding, dict):
+                    raise ExchangeError(401, "JOULEX_VC_INVALID")
+                try:
+                    bind_cred = str(attestation_binding["credential_id"])
+                    bind_nonce = str(attestation_binding["challenge_nonce"])
+                except (KeyError, TypeError):
+                    raise ExchangeError(401, "JOULEX_VC_INVALID") from None
+                ok, reason, _att_info = verify_envelope(
+                    attestation,
+                    credential_id=bind_cred,
+                    challenge_nonce=bind_nonce,
+                    payload_hash=settlement_hash,
+                    pinned_measurements=self.verifier.pinned_measurements or None,
+                    now=now,
+                    provenance_dir=os.path.join(self.store.data_dir, "provenance"),
+                )
+                if not ok:
+                    self._log_attestation_result(
+                        agent_id="exchange", action="settle_market",
+                        reason=reason, envelope=attestation,
+                    )
+                    raise ExchangeError(401, reason)
+                attestation_status = "verified"
+            # M4 chunk 2: the decision basis is captured AFTER all
+            # validation (operator key, market, oracle, outcome,
+            # evidence, attestation) and BEFORE any state changes, so
+            # it describes exactly the settlement that is about to
+            # happen — market state included — and rides on the HCS
+            # message that anchors it.
+            credential_id = (
+                str(attestation_binding["credential_id"])
+                if isinstance(attestation_binding, dict)
+                and attestation_binding.get("credential_id") is not None
+                else "operator"
+            )
+            oracle_label, oracle_snapshot = self._oracle_basis(
+                market,
+                effective_oracle=effective_oracle,
+                observed_value=observed_value,
+                oracle_source_url=oracle_source_url,
+                evidence=evidence,
+            )
+            decision_basis = capture_decision_basis(
+                oracle_label=oracle_label,
+                oracle_snapshot=oracle_snapshot,
+                credential_id=credential_id,
+                market=market,
+            )
+            settlement_id = "stl_" + secrets.token_hex(6)
+            settle_payload = {
+                "market_id": market_id,
+                "outcome": resolved,
+                "observed_value": observed_value,
+                "evidence": evidence,
+                "settlement_id": settlement_id,
+                "decision_basis": decision_basis,
+            }
+            # M4 integration fix: an oversize HCS message fails in
+            # RealHCS.append WITHOUT a queue job, so on_anchor never
+            # fires — a fail-closed settlement would sit
+            # PENDING_ANCHOR forever. Refuse BEFORE appending (the
+            # market stays OPEN, nothing is logged): the estimate
+            # covers payload + attestation + a 4 KiB margin for the
+            # envelope/provenance/timestamp fields the log adds.
+            if (
+                isinstance(self.hcs, RealHCS)
+                and self.settle_anchor_policy == "fail_closed"
+            ):
+                estimate = (
+                    len(canonical_bytes(settle_payload))
+                    + len(canonical_bytes(attestation or {}))
+                    + 4096
+                )
+                if estimate > MAX_MESSAGE_BYTES:
+                    raise ExchangeError(
+                        503,
+                        "HCS_ANCHOR_FAILED: settlement envelope "
+                        f"~{estimate} bytes exceeds HCS message limit "
+                        f"{MAX_MESSAGE_BYTES} bytes",
+                    )
+            # M1: the settlement is one ordered message in the HCS
+            # audit log — appended BEFORE payouts, so a log failure
+            # (503) settles nothing. The anchor carries the decision
+            # basis, so the anchored record is self-describing.
+            appended = self._hcs_append(
+                sender="exchange",
+                action="settle_market",
+                payload=settle_payload,
+                attestation=attestation,
+                provenance={
+                    "told_by": "aeso-oracle" if oracle_source_url is not None else "operator",
+                    "known_facts": [settlement_hash],
+                },
+            )
+            # A superseded ANCHOR_FAILED attempt is replaced by the
+            # fresh one: drop the old pending record now, so the
+            # pending table (and its file) never holds two attempts
+            # for one market.
+            if pending_for_market is not None:
+                self._pending_settlements.pop(
+                    str(pending_for_market["settlement_id"]), None
+                )
+                self._save_pending()
+            # Local mode, or fail_retain under RealHCS: finalize
+            # INLINE exactly as before, plus the receipt sidecar.
+            if isinstance(self.hcs, LocalHCS) or self.settle_anchor_policy == "fail_retain":
+                if isinstance(self.hcs, LocalHCS):
+                    anchor_status = "local"
+                    anchor_job_id = None
+                    hcs_topic = None
+                    topic_sequence = str(appended["sequence"])
+                    consensus_timestamp = appended["consensus_timestamp"]
+                    tx_id = None
+                else:
+                    anchor_status = "queued"
+                    hedera = appended.get("hedera") or {}
+                    anchor_job_id = hedera.get("job_id")
+                    hcs_topic = getattr(self.hcs, "topic_id", None)
+                    topic_sequence = None
+                    consensus_timestamp = appended["consensus_timestamp"]
+                    tx_id = None
+                return self._finalize_settlement(
+                    settlement_id=settlement_id,
+                    market=market,
+                    outcome=resolved,
+                    observed_value=observed_value,
+                    evidence=evidence,
+                    attestation=attestation,
+                    attestation_status=attestation_status,
+                    attestation_binding=attestation_binding,
+                    settlement_hash=settlement_hash,
+                    decision_basis=decision_basis,
+                    oracle_source_url=oracle_source_url,
+                    anchor_job_id=anchor_job_id,
+                    anchor_status=anchor_status,
+                    hcs_topic=hcs_topic,
+                    topic_sequence=topic_sequence,
+                    consensus_timestamp=consensus_timestamp,
+                    tx_id=tx_id,
+                    now=now,
+                )
+            # RealHCS + fail_closed: do NOT pay out. The settlement
+            # waits, PENDING_ANCHOR, until the anchor lands (or dies)
+            # and _handle_anchor finalizes or fails it. The market is
+            # frozen meanwhile: can_trade/can_settle already refuse
+            # non-OPEN markets.
+            hedera = appended.get("hedera") or {}
+            # Belt-and-braces with the pre-append size check above:
+            # an append that failed outright (no queue job, so
+            # on_anchor can never fire) must refuse here rather than
+            # strand a PENDING_ANCHOR record. The market stays OPEN.
+            if hedera.get("status") == "failed":
+                raise ExchangeError(
+                    503,
+                    "HCS_ANCHOR_FAILED: "
+                    + str(hedera.get("error") or "anchor submission failed"),
+                )
+            pending: dict[str, Any] = {
+                "settlement_id": settlement_id,
+                "market_id": market_id,
+                "outcome": resolved,
+                "observed_value": observed_value,
+                "evidence": evidence,
+                "attestation": attestation,
+                "attestation_status": attestation_status,
+                "attestation_binding": attestation_binding,
+                "settlement_hash": settlement_hash,
+                "decision_basis": decision_basis,
+                "anchor_job_id": hedera.get("job_id"),
+                "status": "PENDING_ANCHOR",
+                "created_at": now.isoformat(),
+            }
+            self._pending_settlements[settlement_id] = pending
+            self._save_pending()
+            market["status"] = "SETTLEMENT_PENDING"
+            self.save()
+            return {
+                "settlement_id": settlement_id,
+                "status": "PENDING_ANCHOR",
+                "market_id": market_id,
+                "outcome": resolved,
+                "observed_value": observed_value,
+                "evidence": evidence,
+                "anchor_job_id": hedera.get("job_id"),
+                "decision_basis": decision_basis,
+            }
+
+    # -- settlement helpers (M4 chunk 2) -------------------------------
+    def _oracle_basis(
+        self,
+        market: dict[str, Any],
+        *,
+        effective_oracle: Any,
+        observed_value: float | None,
+        oracle_source_url: str | None,
+        evidence: str | None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Honest oracle label + snapshot for the decision basis.
+
+        - public_source: PUBLIC_SOURCE, snapshot is the evidence hash.
+        - aeso_price with an oracle: AESO-live, unless the oracle
+          carries a synthetic marker (label / is_synthetic /
+          source_label) — then SYNTHETIC, never live. The snapshot
+          is what the oracle resolve returned; ``fetched_at`` is
+          None when the oracle does not expose one (never invented).
+        - aeso_price with no oracle: OPERATOR_VALUE, the
+          operator-supplied observed value."""
+        if market["resolution_type"] == "public_source":
+            return "PUBLIC_SOURCE", {
+                "evidence_hash": hashlib.sha256(
+                    (evidence or "").encode("utf-8")
+                ).hexdigest()
+            }
+        if effective_oracle is not None:
+            label = "AESO-live"
+            marker = (
+                getattr(effective_oracle, "label", None)
+                or getattr(effective_oracle, "source_label", None)
+            )
+            if (
+                marker == "SYNTHETIC"
+                or getattr(effective_oracle, "is_synthetic", False)
+                or getattr(effective_oracle, "synthetic", False)
+                or "Synthetic" in type(effective_oracle).__name__
+            ):
+                label = "SYNTHETIC"
+            fetched_at = None
+            for attr in ("fetched_at", "last_fetched_at", "last_fetch_at"):
+                value = getattr(effective_oracle, attr, None)
+                if value is not None:
+                    fetched_at = (
+                        value.isoformat()
+                        if hasattr(value, "isoformat")
+                        else str(value)
+                    )
+                    break
+            return label, {
+                "max_price": observed_value,
+                "source_url": oracle_source_url,
+                "fetched_at": fetched_at,
+            }
+        return "OPERATOR_VALUE", {
+            "max_price": observed_value,
+            "source_url": None,
+            "fetched_at": None,
+        }
+
+    def _finalize_settlement(
+        self,
+        *,
+        settlement_id: str,
+        market: dict[str, Any],
+        outcome: str,
+        observed_value: float | None,
+        evidence: str | None,
+        attestation: dict[str, Any] | None,
+        attestation_status: str,
+        attestation_binding: dict[str, Any] | None,
+        settlement_hash: str,
+        decision_basis: dict[str, Any],
+        oracle_source_url: str | None,
+        anchor_job_id: str | None,
+        anchor_status: str,
+        hcs_topic: str | None,
+        topic_sequence: str | None,
+        consensus_timestamp: str | None,
+        tx_id: str | None,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Pay out one settlement and write both durable records.
+
+        Shared by the inline path and by _handle_anchor (the anchor
+        landing). The settlements.jsonl record (via the settlement
+        hook) is built first; the receipt sidecar's
+        ledger_entry_hash is the SHA-256 of its canonical bytes.
+        The returned dict IS the settlements.jsonl record, with
+        settlement_id + status SETTLED added."""
+        payouts = self.ledger.settle_market(market["market_id"], outcome)
+        market["status"] = "RESOLVED"
+        market["outcome"] = outcome
+        market["observed_value"] = observed_value
+        market["evidence"] = evidence
+        market["settled_at"] = now.isoformat()
+        receipt = {
+            "settlement_id": settlement_id,
+            "status": "SETTLED",
+            "market_id": market["market_id"],
+            "question": market["question"],
+            "resolution_type": market["resolution_type"],
+            "resolution_source_url": market["resolution_source_url"],
+            "outcome": outcome,
+            "observed_value": observed_value,
+            "evidence": evidence,
+            "settled_at": now.isoformat(),
+            "payouts": payouts,
+            # M1: the settlement attestation (if any) rides on the
+            # receipt, with its verification status.
+            "attestation": attestation,
+            "attestation_status": attestation_status,
+        }
+        if oracle_source_url is not None:
+            receipt["oracle_source_url"] = oracle_source_url
+        self.settlement_hook.on_settlement(receipt)
+        sidecar = {
+            "settlement_id": settlement_id,
+            "market_id": market["market_id"],
+            "outcome": outcome,
+            "observed_value": observed_value,
+            "evidence": evidence,
+            "settled_at": now.isoformat(),
+            "ledger_entry_hash": hashlib.sha256(
+                canonical_bytes(receipt)
+            ).hexdigest(),
+            "hcs_topic": hcs_topic,
+            "topic_sequence": topic_sequence,
+            "consensus_timestamp": consensus_timestamp,
+            "tx_id": tx_id,
+            "attestation": attestation,
+            "attestation_status": attestation_status,
+            "attestation_binding": attestation_binding,
+            "inputs_hash": decision_basis["inputs_hash"],
+            "decision_basis": decision_basis,
+            "anchor_job_id": anchor_job_id,
+            "anchor_status": anchor_status,
+            "transfer_tx_id": None,
+        }
+        append_receipt(self.store.data_dir, sidecar)
+        self.save()
+        self._counters["settlements"] += 1
+        return receipt
+
+    def _handle_anchor(
+        self, message: dict[str, Any], receipt: dict[str, Any]
+    ) -> None:
+        """Anchor callback (RealHCS on_anchor): a queued anchor job
+        reached a terminal state. Only settle_market messages carry
+        a pending settlement. Runs on the anchor worker thread, so it
+        takes the exchange lock itself. Never raises for a missing
+        pending record — the anchor is already recorded durably, and
+        a callback failure must never lose it."""
+        with self._lock:
+            try:
+                if message.get("action") != "settle_market":
+                    return
+                payload = message.get("payload") or {}
+                settlement_id = str(payload.get("settlement_id", ""))
+                pending = self._pending_settlements.get(settlement_id)
+                if pending is None:
+                    # E.g. fail_retain settled inline already: the
+                    # anchor landing changes nothing.
+                    print(
+                        "joulex: _handle_anchor: no pending settlement "
+                        f"for {settlement_id!r} (already finalized?)",
+                        file=sys.stderr,
+                    )
+                    return
+                status = str(receipt.get("status", ""))
+                if status == "SUCCESS":
+                    market = self.markets.get(str(pending["market_id"]))
+                    if market is None:
+                        print(
+                            "joulex: _handle_anchor: market "
+                            f"{pending['market_id']!r} for settlement "
+                            f"{settlement_id!r} is gone; pending kept",
+                            file=sys.stderr,
+                        )
+                        return
+                    self._finalize_settlement(
+                        settlement_id=settlement_id,
+                        market=market,
+                        outcome=str(pending["outcome"]),
+                        observed_value=pending.get("observed_value"),
+                        evidence=pending.get("evidence"),
+                        attestation=pending.get("attestation"),
+                        attestation_status=str(
+                            pending.get("attestation_status", "absent")
+                        ),
+                        attestation_binding=pending.get("attestation_binding"),
+                        settlement_hash=str(pending.get("settlement_hash", "")),
+                        decision_basis=dict(pending["decision_basis"]),
+                        oracle_source_url=(
+                            pending["decision_basis"]["oracle"]["snapshot"].get(
+                                "source_url"
+                            )
+                            if isinstance(
+                                pending.get("decision_basis"), dict
+                            )
+                            and isinstance(
+                                pending["decision_basis"].get("oracle"), dict
+                            )
+                            and isinstance(
+                                pending["decision_basis"]["oracle"].get("snapshot"),
+                                dict,
+                            )
+                            else None
+                        ),
+                        anchor_job_id=pending.get("anchor_job_id"),
+                        anchor_status="anchored",
+                        hcs_topic=getattr(self.hcs, "topic_id", None),
+                        topic_sequence=(
+                            str(receipt["topic_sequence"])
+                            if receipt.get("topic_sequence") is not None
+                            else None
+                        ),
+                        consensus_timestamp=receipt.get("consensus_timestamp"),
+                        tx_id=(
+                            receipt.get("transaction_id")
+                            or receipt.get("tx_id")
+                        ),
+                        now=self.now(),
+                    )
+                    del self._pending_settlements[settlement_id]
+                    self._save_pending()
+                elif status == "failed":
+                    pending["status"] = "ANCHOR_FAILED"
+                    self._save_pending()
+                else:
+                    print(
+                        "joulex: _handle_anchor: unexpected anchor "
+                        f"receipt status {status!r} for {settlement_id!r}",
+                        file=sys.stderr,
+                    )
+            except Exception as exc:  # noqa: BLE001 — never lose an anchor
+                print(
+                    f"joulex: _handle_anchor failed: {exc}",
+                    file=sys.stderr,
+                )
+
+    # -- info / metrics ----------------------------------------------
+    def metrics(self) -> dict[str, Any]:
+        """Process-start counters + HCS submission stats (audit
+        2026-11-12). Counters are in-memory since process start; the
+        durable record is the HCS log + trades/settlements logs."""
+        return {
+            **dict(self._counters),
+            "uptime_seconds": round(
+                (datetime.now(timezone.utc) - self._started_at).total_seconds(), 3
+            ),
+            "hcs": self.hcs.hcs_stats(),
+        }
+
+    def info(self, *, demo_clock: bool = False) -> dict[str, Any]:
+        hcs = self.hcs.hcs_info()
+        return {
+            "name": "joulex",
+            "version": __version__,
+            "paper_only": True,
+            "demo_clock": demo_clock,
+            "aeso_oracle": self.settlement_oracle is not None,
+            "operator_key_configured": self.operator_key is not None,
+            "server_time": self.now().isoformat(),
+            "markets": len(self.markets),
+            # M1: the Verifiable Compute layer. The envelope is a
+            # SOFTWARE attestation — it proves which code tree minted
+            # an action, never a hardware TEE claim. The HCS mode is
+            # the LIVE mode (audit 2026-11-12: this used to hardcode
+            # "local" even when anchoring to a real topic).
+            "verifiable_compute": {
+                "envelope_version": "joulex-attest-0.1",
+                "kind": "software",
+                "hcs_mode": hcs["mode"],
+                "hcs_topic": hcs["topic"],
+                "hcs_network": hcs["network"],
+            },
+        }

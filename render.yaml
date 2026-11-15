@@ -1,0 +1,45 @@
+# Render Blueprint — JouleX (free tier, $0, paper-only).
+#
+# Deploy: push this directory to a Git repo, then in the Render
+# dashboard: New > Web Service > connect the repo > Render detects
+# this render.yaml > choose the Free plan > Create. No secret env vars
+# are needed for this first deploy; no card is required.
+#
+# Free-tier facts (vendor docs, same shape as the philosophy-tools
+# deploy): 750 instance-hours/month, 512 MB RAM, 0.1 CPU. The service
+# SLEEPS after 15 min idle and takes ~30-60s to wake on the next
+# request — the first call after a sleep is slow, later calls are
+# normal.
+#
+# Ephemeral disk: the exchange state (ledger, challenge store, HCS
+# audit log) lives in data/ inside the container. It survives
+# sleep/wake on the same instance but is WIPED on redeploy — after a
+# redeploy the book starts empty and the audit log restarts. This is a
+# paper-only demo; a persistent store is a later step, not this one.
+#
+# Audit log: this deploy runs the LOCAL HCS log only. Do NOT set
+# JOULEX_HCS_MODE=hedera and do NOT set JOULEX_HCS_PRIVATE_KEY here —
+# live Hedera submission needs a signing key and is a separate,
+# owner-approved step (see docs/HEDERA.md). data/hcs_config.json in
+# the repo names the testnet topic, but with the mode flag unset the
+# server stays local.
+#
+# Demo trading: the server trusts one demo issuer (see
+# data/trust_store.demo.json — public keys only, DEMO ONLY). To trade
+# against the deployed server, mint demo agents AND refresh the
+# revocation list first:
+#   JOULEX_DEMO_ISSUER_SEED_HEX=<seed> python3 scripts/mint_demo_agents.py --url https://<service>.onrender.com
+# Revocation lists go stale after 1 hour and credentials last at most
+# 24h (CF-KYA rules): re-run the script before each demo session.
+# The seed is throwaway demo key material held by the owner, never in
+# this repo and never in this file.
+#
+# Health check is GET / (returns the exchange info JSON).
+services:
+  - type: web
+    name: joulex
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -m joulex.server --host 0.0.0.0 --port $PORT --trust-store data/trust_store.demo.json
+    healthCheckPath: /
